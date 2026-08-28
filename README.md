@@ -46,6 +46,29 @@ The command writes per-session results and aggregate metrics to `results.json`.
 The included weak BM25 starter scores Hit Rate@10 `0.125`, MRR `0.068034`, and
 MTTC `9.81` on the released public set. See `docs/baseline_results.json`.
 
+## Implemented Agent
+
+The current `starter/agent.py` connects two offline components:
+
+- `starter/tracker.py` maintains provenance-aware constraints, exclusions,
+  boundary responses, question history, and targeted intent overrides.
+- `starter/retriever.py` uses SQLite FTS5 for multi-route candidate generation,
+  then reranks with cumulative constraint coverage, exclusions, price proximity,
+  profile tie-breakers, and catalog-valid fallbacks.
+
+The implementation uses only the Python standard library and requires no API
+key or network connection. Run all tests and the public evaluator with:
+
+```bash
+python3 -m unittest discover -v
+python3 -m evaluator.local_evaluator
+```
+
+On the released 200-session set, the implemented agent scores Hit Rate@10
+`0.91`, MRR `0.616841`, MTTC `3.22`, and TechnicalScore `0.795652`. Public-set
+metrics are development results and should not be interpreted as private-set
+performance.
+
 ## Agent Interface
 
 ```python
