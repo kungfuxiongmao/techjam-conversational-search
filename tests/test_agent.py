@@ -104,6 +104,21 @@ class RetrieverAndAgentTest(unittest.TestCase):
         # Synonym expansion maps 'sneakers' -> 'running', 'shoe', so SHOE should rank #1
         self.assertEqual(ranked[0]["parent_asin"], "SHOE")
 
+    def test_retriever_dual_track_override_routing(self) -> None:
+        retriever = ProductRetriever(self.catalog_path)
+        state = new_buyer_state("s", {})
+        update_buyer_state(state, "I'm looking for Men Shirts. 100% cotton fabric", 1)
+        update_buyer_state(state, "For that, what matters is: color: black.", 2)
+        # Turn 3: Override to warm wool
+        update_buyer_state(
+            state,
+            "Actually, ignore my earlier preference. What I need is: warm wool.",
+            3,
+        )
+        ranked = retriever.recommend(state, 4)
+        # Dual-track override routing should immediately prioritize the wool shirt
+        self.assertEqual(ranked[0]["parent_asin"], "WOOL")
+
     def test_agent_returns_valid_contract_and_tracks_question(self) -> None:
         agent = Agent(self.catalog_path)
         agent.reset("session", {"preference_tags": ["comfort"]})

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import math
 import re
@@ -76,8 +77,9 @@ except ImportError:
     _LEMMATIZER = None
 
 
+@functools.lru_cache(maxsize=16384)
 def _stem_word(word: str) -> str:
-    """Uses NLTK WordNetLemmatizer and PorterStemmer to normalize words to their base root."""
+    """Uses NLTK WordNetLemmatizer and PorterStemmer with an algorithmic fallback."""
     w = word.casefold().strip()
     if len(w) <= 2:
         return w
@@ -92,7 +94,22 @@ def _stem_word(word: str) -> str:
         except Exception:
             pass
     if _STEMMER is not None:
-        return _STEMMER.stem(w)
+        try:
+            return _STEMMER.stem(w)
+        except Exception:
+            pass
+
+    # Built-in algorithmic fallback when NLTK is not present
+    if len(w) > 4 and w.endswith("ies"):
+        return w[:-3] + "y"
+    if len(w) > 4 and (w.endswith("ses") or w.endswith("xes") or w.endswith("zes") or w.endswith("ches") or w.endswith("shes")):
+        return w[:-2]
+    if len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        return w[:-1]
+    if len(w) > 5 and w.endswith("ing") and not w.endswith("thing"):
+        return w[:-3]
+    if len(w) > 4 and w.endswith("ed"):
+        return w[:-2]
     return w
 
 
@@ -150,13 +167,13 @@ def _expand_terms(terms: Iterable[str], limit: int = 36) -> list[str]:
             seen.add(stemmed)
             result.append(stemmed)
 
-        if stemmed in SYNONYM_MAP:
-            for syn in SYNONYM_MAP[stemmed]:
-                if syn not in seen and syn not in STOPWORDS:
-                    seen.add(syn)
-                    result.append(syn)
-                    if len(result) >= limit:
-                        return result
+        synonyms = SYNONYM_MAP.get(raw_term) or SYNONYM_MAP.get(stemmed) or ()
+        for syn in synonyms:
+            if syn not in seen and syn not in STOPWORDS:
+                seen.add(syn)
+                result.append(syn)
+                if len(result) >= limit:
+                    return result
     return result
 
 
@@ -268,7 +285,7 @@ class ProductRetriever:
         return records
 
     def _candidate_scores(self, state: dict[str, Any]) -> dict[str, float]:
-        """Generate an initial candidate pool of products using multi-route search and score fusion."""
+        """Generate candidate pool using dynamic Dual-Track Intent Routing (Pillar I)."""
         # Step 1: Extract active category and clue terms from Agent 1's state
         constraints = active_constraints(state)
         category_terms = _terms(constraints.get("category", []), 24)
@@ -283,34 +300,58 @@ class ProductRetriever:
         clue_terms = _terms([record["value"] for _, record in records], 48)
         latest_terms = _terms([record["value"] for _, record in records[-2:]], 32)
 
-        # Step 2: Define parallel search routes with tailored operators, limits, and importance weights
-        # Route schema: (terms_list, boolean_operator, candidate_limit, route_weight)
+        scenario = state.get("scenario_detected", "unknown")
+        turn = state.get("turn_count", 1)
         routes: list[tuple[list[str], str, int, float]] = []
-        
-        # Route A: Broad Category (with synonyms) + Clues (OR) -> ensures wide coverage / recall
-        if expanded_category_terms or clue_terms:
-            routes.append((expanded_category_terms + clue_terms, "OR", 350, 1.0))
-            
-        # Route B: Strict Category + Clues (AND) -> highest precision route when target has both
-        if category_terms and clue_terms:
-            routes.append((category_terms + clue_terms[:32], "AND", 220, 2.2))
-            
-        # Route C: All Clue attributes combined (AND) -> matches multi-attribute combinations
-        if clue_terms:
-            routes.append((clue_terms[:24], "AND", 180, 1.8))
-            
-        # Route D: Focus on the latest revealed facts (AND & OR) -> fast adaptation to new turns
-        if latest_terms:
-            routes.append((latest_terms, "AND", 180, 1.6))
-            routes.append((latest_terms, "OR", 220, 1.1))
-            
-        # Route E: Expanded category-only fallback route (OR)
-        if expanded_category_terms:
-            routes.append((expanded_category_terms, "OR", 220, 0.55))
-            
-        # Route F: Individual attribute phrases (AND) -> ensures specific phrases get matched
-        for _, record in records[-4:]:
-            individual = _terms(record["value"], 20)
+
+        # =========================================================================
+        # TRACK 1: INTENT OVERRIDE TRACK (Target Changed Mind)
+        # =========================================================================
+        if scenario == "intent_override":
+            override_records = [r for _, r in records if r.get("source") == "override"]
+            override_terms = _terms([r["value"] for r in override_records], 32)
+            if override_terms:
+                if category_terms:
+                    routes.append((category_terms + override_terms, "AND", 180, 3.5))
+                routes.append((override_terms, "AND", 150, 3.0))
+                routes.append((override_terms, "OR", 220, 1.8))
+            if category_terms:
+                routes.append((category_terms, "OR", 200, 0.8))
+
+        # =========================================================================
+        # TRACK 2: HIGH-PRECISION BUYING TRACK (Strict Hard Constraints)
+        # =========================================================================
+        elif scenario == "buying" or turn >= 3 or len(records) >= 2:
+            # High precision strict AND routes
+            if category_terms and clue_terms:
+                routes.append((category_terms + clue_terms[:28], "AND", 180, 3.2))
+            if latest_terms:
+                routes.append((latest_terms, "AND", 140, 2.4))
+                routes.append((latest_terms, "OR", 200, 1.2))
+            if clue_terms:
+                routes.append((clue_terms[:20], "AND", 140, 2.0))
+            # Background recall routes
+            if expanded_category_terms or clue_terms:
+                routes.append((expanded_category_terms + clue_terms, "OR", 300, 0.7))
+            if expanded_category_terms:
+                routes.append((expanded_category_terms, "OR", 200, 0.5))
+
+        # =========================================================================
+        # TRACK 3: EXPLORATORY BROWSING TRACK (Open Exploration & High Coverage)
+        # =========================================================================
+        else:
+            # Broad category coverage with synonym expansion
+            if expanded_category_terms:
+                routes.append((expanded_category_terms, "OR", 380, 2.5))
+                routes.append((category_terms, "OR", 220, 1.8))
+            if clue_terms:
+                routes.append((clue_terms, "OR", 250, 1.5))
+                if category_terms:
+                    routes.append((category_terms + clue_terms[:12], "AND", 120, 1.4))
+
+        # Single attribute phrase routes for exact phrase matching
+        for _, record in records[-3:]:
+            individual = _terms(record["value"], 16)
             if individual:
                 routes.append((individual, "AND", 100, 1.25))
 

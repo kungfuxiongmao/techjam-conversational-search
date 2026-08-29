@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 results.json
+.benchmark_history.json
 data/catalog.jsonl
 data/releases/
 # Organizer-only code, private evaluation data, manifests, and build reports.

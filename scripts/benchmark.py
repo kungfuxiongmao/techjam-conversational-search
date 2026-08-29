@@ -21,12 +21,16 @@ RESULTS_PATH = ROOT_DIR / "results.json"
 BASELINE_PATH = ROOT_DIR / "docs" / "baseline_results.json"
 HISTORY_PATH = ROOT_DIR / ".benchmark_history.json"
 
+VENV_PYTHON = ROOT_DIR / ".venv" / "bin" / "python"
+PYTHON_BIN = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
+
 
 def run_unit_tests() -> bool:
     print("┌─────────────────────────────────────────────────────────────┐")
     print("│                    1. RUNNING UNIT TESTS                    │")
+    print(f"│ Environment: {Path(PYTHON_BIN).parent.parent.name + '/' + Path(PYTHON_BIN).name:<47} │")
     print("└─────────────────────────────────────────────────────────────┘")
-    cmd = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]
+    cmd = [PYTHON_BIN, "-m", "unittest", "discover", "-s", "tests", "-v"]
     result = subprocess.run(cmd, cwd=str(ROOT_DIR))
     if result.returncode != 0:
         print("\n❌ Unit tests failed! Fix failing tests before proceeding.")
@@ -38,6 +42,7 @@ def run_unit_tests() -> bool:
 def run_local_evaluator() -> dict | None:
     print("\n┌─────────────────────────────────────────────────────────────┐")
     print("│         2. EXECUTING LOCAL EVALUATOR (200 Sessions)         │")
+    print(f"│ Environment: {Path(PYTHON_BIN).parent.parent.name + '/' + Path(PYTHON_BIN).name:<47} │")
     print("└─────────────────────────────────────────────────────────────┘")
 
     if not CATALOG_PATH.exists():
@@ -49,7 +54,7 @@ def run_local_evaluator() -> dict | None:
 
     print("Evaluating 200 public sessions... (this may take a few seconds)")
     cmd = [
-        sys.executable,
+        PYTHON_BIN,
         "-m",
         "evaluator.local_evaluator",
         "--catalog",
