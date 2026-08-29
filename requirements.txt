@@ -1,0 +1,2 @@
+# TechJam 2026 Conversational Search Hackathon Dependencies
+nltk>=3.9.2

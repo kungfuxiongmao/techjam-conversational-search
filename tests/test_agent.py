@@ -95,6 +95,15 @@ class RetrieverAndAgentTest(unittest.TestCase):
         ranked = retriever.recommend(state, 4)
         self.assertNotEqual(ranked[0]["parent_asin"], "WOOL")
 
+    def test_retriever_matches_synonyms(self) -> None:
+        retriever = ProductRetriever(self.catalog_path)
+        state = new_buyer_state("s", {})
+        # User says "sneakers" which does not appear in product title "Black Running Shoe"
+        update_buyer_state(state, "I'm looking for sneakers, but I'm still exploring.", 1)
+        ranked = retriever.recommend(state, 4)
+        # Synonym expansion maps 'sneakers' -> 'running', 'shoe', so SHOE should rank #1
+        self.assertEqual(ranked[0]["parent_asin"], "SHOE")
+
     def test_agent_returns_valid_contract_and_tracks_question(self) -> None:
         agent = Agent(self.catalog_path)
         agent.reset("session", {"preference_tags": ["comfort"]})

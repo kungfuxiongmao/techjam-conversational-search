@@ -61,6 +61,105 @@ def _numeric_price(value: object) -> float | None:
     return price if math.isfinite(price) and price >= 0 else None
 
 
+try:
+    import nltk
+    from nltk.stem import PorterStemmer, WordNetLemmatizer
+
+    _local_nltk_dir = Path(__file__).resolve().parent.parent / ".venv" / "nltk_data"
+    if _local_nltk_dir.exists():
+        nltk.data.path.append(str(_local_nltk_dir))
+
+    _STEMMER: PorterStemmer | None = PorterStemmer()
+    _LEMMATIZER: WordNetLemmatizer | None = WordNetLemmatizer()
+except ImportError:
+    _STEMMER = None
+    _LEMMATIZER = None
+
+
+def _stem_word(word: str) -> str:
+    """Uses NLTK WordNetLemmatizer and PorterStemmer to normalize words to their base root."""
+    w = word.casefold().strip()
+    if len(w) <= 2:
+        return w
+    if _LEMMATIZER is not None:
+        try:
+            w_noun = _LEMMATIZER.lemmatize(w, pos="n")
+            if w_noun != w:
+                return w_noun
+            w_verb = _LEMMATIZER.lemmatize(w, pos="v")
+            if w_verb != w:
+                return w_verb
+        except Exception:
+            pass
+    if _STEMMER is not None:
+        return _STEMMER.stem(w)
+    return w
+
+
+SYNONYM_MAP: dict[str, tuple[str, ...]] = {
+    # Footwear
+    "sneaker": ("shoe", "running", "athletic", "trainer", "footwear"),
+    "shoe": ("footwear", "sneaker"),
+    "boot": ("footwear", "ankle", "hiking"),
+    "sandal": ("slide", "open", "toe", "flip", "flop"),
+    "heel": ("pump", "stiletto"),
+    # Tops & Shirts
+    "tee": ("t-shirt", "shirt", "top"),
+    "t-shirt": ("tee", "shirt", "top"),
+    "tshirt": ("t-shirt", "tee", "shirt", "top"),
+    "shirt": ("top", "tee", "blouse", "button"),
+    "hoodie": ("sweatshirt", "pullover", "hooded"),
+    "sweatshirt": ("hoodie", "pullover", "fleece", "crewneck"),
+    "sweater": ("knit", "pullover", "cardigan"),
+    # Outerwear
+    "jacket": ("coat", "outerwear", "windbreaker", "parka"),
+    "coat": ("jacket", "outerwear", "parka", "overcoat"),
+    # Bottoms
+    "jeans": ("denim", "pants", "trousers"),
+    "pants": ("trousers", "slacks", "jeans", "chinos"),
+    "shorts": ("trunks", "bermuda"),
+    "leggings": ("tights", "pants", "yoga"),
+    # Jewelry
+    "jewelry": ("ring", "necklace", "earring", "bracelet"),
+    "earring": ("stud", "hoop", "dangle"),
+    "necklace": ("pendant", "chain", "choker"),
+    "bracelet": ("bangle", "cuff", "wristband"),
+    # Materials
+    "denim": ("jean", "cotton"),
+    "leather": ("genuine", "faux", "pu"),
+    # Styles & Use cases
+    "workout": ("gym", "running", "athletic", "fitness"),
+    "running": ("athletic", "workout", "training", "shoe"),
+    "hiking": ("outdoor", "trail", "trekking", "boot"),
+    "winter": ("warm", "thermal", "fleece"),
+    "summer": ("beach", "lightweight", "breathable"),
+}
+
+
+def _expand_terms(terms: Iterable[str], limit: int = 36) -> list[str]:
+    """Expands query terms with root-word stem matching and domain synonyms."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw_term in terms:
+        if raw_term not in seen and raw_term not in STOPWORDS:
+            seen.add(raw_term)
+            result.append(raw_term)
+
+        stemmed = _stem_word(raw_term)
+        if stemmed not in seen and stemmed not in STOPWORDS:
+            seen.add(stemmed)
+            result.append(stemmed)
+
+        if stemmed in SYNONYM_MAP:
+            for syn in SYNONYM_MAP[stemmed]:
+                if syn not in seen and syn not in STOPWORDS:
+                    seen.add(syn)
+                    result.append(syn)
+                    if len(result) >= limit:
+                        return result
+    return result
+
+
 @dataclass(frozen=True)
 class ProductDocument:
     parent_asin: str
@@ -91,7 +190,7 @@ class ProductRetriever:
         cursor.execute(
             "CREATE VIRTUAL TABLE product_fts USING fts5("
             "parent_asin UNINDEXED, title, categories, features, details, store, description, "
-            "tokenize='unicode61 remove_diacritics 2')"
+            "tokenize='porter unicode61 remove_diacritics 2')"
         )
         batch: list[tuple[str, str, str, str, str, str, str]] = []
         with self.catalog_path.open(encoding="utf-8") as handle:
@@ -173,6 +272,7 @@ class ProductRetriever:
         # Step 1: Extract active category and clue terms from Agent 1's state
         constraints = active_constraints(state)
         category_terms = _terms(constraints.get("category", []), 24)
+        expanded_category_terms = _expand_terms(category_terms, 32)
         records = [
             (attribute, record)
             for attribute, record in self._active_records(state)
@@ -186,24 +286,28 @@ class ProductRetriever:
         # Step 2: Define parallel search routes with tailored operators, limits, and importance weights
         # Route schema: (terms_list, boolean_operator, candidate_limit, route_weight)
         routes: list[tuple[list[str], str, int, float]] = []
-        # Route A: Broad Category + Clues (OR) -> ensures wide coverage / recall
-        if category_terms or clue_terms:
-            routes.append((category_terms + clue_terms, "OR", 350, 1.0))
+        
+        # Route A: Broad Category (with synonyms) + Clues (OR) -> ensures wide coverage / recall
+        if expanded_category_terms or clue_terms:
+            routes.append((expanded_category_terms + clue_terms, "OR", 350, 1.0))
+            
         # Route B: Strict Category + Clues (AND) -> highest precision route when target has both
         if category_terms and clue_terms:
-            # Simulator clues are copied from the target metadata, so the strict
-            # category-plus-clue route is high precision even for generic facts.
             routes.append((category_terms + clue_terms[:32], "AND", 220, 2.2))
+            
         # Route C: All Clue attributes combined (AND) -> matches multi-attribute combinations
         if clue_terms:
             routes.append((clue_terms[:24], "AND", 180, 1.8))
+            
         # Route D: Focus on the latest revealed facts (AND & OR) -> fast adaptation to new turns
         if latest_terms:
             routes.append((latest_terms, "AND", 180, 1.6))
             routes.append((latest_terms, "OR", 220, 1.1))
-        # Route E: Category-only fallback route (OR)
-        if category_terms:
-            routes.append((category_terms, "OR", 220, 0.55))
+            
+        # Route E: Expanded category-only fallback route (OR)
+        if expanded_category_terms:
+            routes.append((expanded_category_terms, "OR", 220, 0.55))
+            
         # Route F: Individual attribute phrases (AND) -> ensures specific phrases get matched
         for _, record in records[-4:]:
             individual = _terms(record["value"], 20)
@@ -223,14 +327,15 @@ class ProductRetriever:
         if not terms:
             return 0.0
         text_terms = set(text.split())
-        return sum(term in text_terms for term in terms) / len(terms)
+        stemmed_text = {_stem_word(t) for t in text_terms}
+        matches = sum(1 for term in terms if term in text_terms or _stem_word(term) in stemmed_text)
+        return matches / len(terms)
 
     def _rerank_score(self, document: ProductDocument, state: dict[str, Any], retrieval_score: float) -> float:
-        # Set base candidate score
+        # Step 1: Base score from multi-route candidate retrieval stage
         score = retrieval_score * 100.0
 
         for attribute, record in self._active_records(state):
-            # Match categories
             value_terms = _terms(record["value"], 40)
             if not value_terms:
                 continue
@@ -239,27 +344,34 @@ class ProductRetriever:
             if attribute == "category":
                 field = f"{document.categories} {document.title}"
                 coverage = self._coverage(value_terms, field)
+                if coverage < 1.0:
+                    expanded = _expand_terms(value_terms, 24)
+                    coverage = max(coverage, self._coverage(expanded, field) * 0.9)
                 score += 7.0 * coverage
                 if " ".join(value_terms) in field:
                     score += 2.0
                 continue
-            
-            # Match attributes & Manage intent override
+
+            # Step 2: Cumulative attribute matching & intent override weighting
             coverage = self._coverage(value_terms, document.combined)
-            source_weight = 1.35 if record.get("source") == "override" else 1.0 # intent override
+            if coverage < 1.0:
+                expanded = _expand_terms(value_terms, 24)
+                coverage = max(coverage, self._coverage(expanded, document.combined) * 0.85)
+
+            source_weight = 1.35 if record.get("source") == "override" else 1.0
             score += source_weight * 10.0 * coverage
             normalized_phrase = " ".join(value_terms)
             if normalized_phrase and normalized_phrase in document.combined:
                 score += source_weight * 7.0
-            if attribute in {"material", "color", "brand"} and coverage == 1.0:
+            if attribute in {"material", "color", "brand"} and coverage >= 1.0:
                 score += source_weight * 3.0
 
-        # Penalty for excluded terms
+        # Step 3: Heavy penalty for user-rejected / negated terms (e.g. "no wool")
         for excluded in state.get("excluded_terms", []):
             if re.search(rf"\b{re.escape(str(excluded).casefold())}\b", document.combined):
                 score -= 80.0
 
-        # Scoring by Budget and Price Proximity
+        # Step 4: Budget & price proximity calculations (maximum vs around)
         for record in state["constraints"].get("budget", []):
             if record.get("status") != "active" or "numeric_value" not in record:
                 continue
@@ -272,7 +384,7 @@ class ProductRetriever:
                 scale = max(5.0, target * 0.25)
                 score += 10.0 * max(0.0, 1.0 - abs(document.price - target) / scale)
 
-        # Personalise by user profile
+        # Step 5: User profile personalization & catalog rating quality
         profile = state.get("user_profile") or {}
         for tag in profile.get("preference_tags", []) or []:
             tag_terms = _terms(tag, 4)
@@ -284,27 +396,21 @@ class ProductRetriever:
         return score
 
     def _category_fallback(self, state: dict[str, Any], needed: int, seen: set[str]) -> list[str]:
-        """
-        Safety fallback to guarantee returning 10 catalog-valid recommendations.
-        
-        If specific searches return fewer than 10 items (e.g. Turn 1 with vague clues),
-        this fills the remaining slots using:
-        1. Broader category searches from the active category terms.
-        2. Precomputed popular/high-rated products in the catalog.
-        """
+        """Safety fallback to guarantee returning 10 catalog-valid recommendations."""
         categories = active_constraints(state).get("category", [])
         category_terms = _terms(categories, 24)
+        expanded_terms = _expand_terms(category_terms, 32)
         result: list[str] = []
-
-        # Fallback Level 1: Broader category matches
-        if category_terms:
-            for parent_asin in self._search(category_terms, max(needed * 8, 80), "OR"):
+        
+        # Fallback Level 1: Broader category matches (with synonyms)
+        if expanded_terms:
+            for parent_asin in self._search(expanded_terms, max(needed * 8, 80), "OR"):
                 if parent_asin not in seen:
                     seen.add(parent_asin)
                     result.append(parent_asin)
                     if len(result) >= needed:
                         return result
-        
+                        
         # Fallback Level 2: Top popular/high-rated catalog items
         for parent_asin in self._popular:
             if parent_asin not in seen:
