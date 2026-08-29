@@ -119,6 +119,15 @@ class RetrieverAndAgentTest(unittest.TestCase):
         # Dual-track override routing should immediately prioritize the wool shirt
         self.assertEqual(ranked[0]["parent_asin"], "WOOL")
 
+    def test_retriever_field_specific_title_boosting(self) -> None:
+        retriever = ProductRetriever(self.catalog_path)
+        state = new_buyer_state("s", {})
+        update_buyer_state(state, "I'm looking for Men Shirts T-Shirts. A key requirement is: 100% cotton.", 1)
+        update_buyer_state(state, "For that, what matters is: crew neck.", 2)
+        ranked = retriever.recommend(state, 4)
+        # TARGET matches both 100% cotton and crew neck in Title and Features, ranking it #1
+        self.assertEqual(ranked[0]["parent_asin"], "TARGET")
+
     def test_agent_returns_valid_contract_and_tracks_question(self) -> None:
         agent = Agent(self.catalog_path)
         agent.reset("session", {"preference_tags": ["comfort"]})

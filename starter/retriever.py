@@ -286,7 +286,7 @@ class ProductRetriever:
 
     def _candidate_scores(self, state: dict[str, Any]) -> dict[str, float]:
         """Generate candidate pool using dynamic Dual-Track Intent Routing (Pillar I)."""
-        # Step 1: Extract active category and clue terms from Agent 1's state
+        # Step 1: Extract active category and clue terms from dialogue state
         constraints = active_constraints(state)
         category_terms = _terms(constraints.get("category", []), 24)
         expanded_category_terms = _expand_terms(category_terms, 32)
@@ -304,9 +304,8 @@ class ProductRetriever:
         turn = state.get("turn_count", 1)
         routes: list[tuple[list[str], str, int, float]] = []
 
-        # =========================================================================
-        # TRACK 1: INTENT OVERRIDE TRACK (Target Changed Mind)
-        # =========================================================================
+        # Step 2: Configure search routes based on the detected buyer scenario
+        # Track A: Intent override routing when preferences change
         if scenario == "intent_override":
             override_records = [r for _, r in records if r.get("source") == "override"]
             override_terms = _terms([r["value"] for r in override_records], 32)
@@ -318,11 +317,8 @@ class ProductRetriever:
             if category_terms:
                 routes.append((category_terms, "OR", 200, 0.8))
 
-        # =========================================================================
-        # TRACK 2: HIGH-PRECISION BUYING TRACK (Strict Hard Constraints)
-        # =========================================================================
+        # Track B: High-precision routing for buying sessions or later turns
         elif scenario == "buying" or turn >= 3 or len(records) >= 2:
-            # High precision strict AND routes
             if category_terms and clue_terms:
                 routes.append((category_terms + clue_terms[:28], "AND", 180, 3.2))
             if latest_terms:
@@ -330,17 +326,13 @@ class ProductRetriever:
                 routes.append((latest_terms, "OR", 200, 1.2))
             if clue_terms:
                 routes.append((clue_terms[:20], "AND", 140, 2.0))
-            # Background recall routes
             if expanded_category_terms or clue_terms:
                 routes.append((expanded_category_terms + clue_terms, "OR", 300, 0.7))
             if expanded_category_terms:
                 routes.append((expanded_category_terms, "OR", 200, 0.5))
 
-        # =========================================================================
-        # TRACK 3: EXPLORATORY BROWSING TRACK (Open Exploration & High Coverage)
-        # =========================================================================
+        # Track C: Exploratory browsing routing for broad early-turn discovery
         else:
-            # Broad category coverage with synonym expansion
             if expanded_category_terms:
                 routes.append((expanded_category_terms, "OR", 380, 2.5))
                 routes.append((category_terms, "OR", 220, 1.8))
@@ -349,14 +341,13 @@ class ProductRetriever:
                 if category_terms:
                     routes.append((category_terms + clue_terms[:12], "AND", 120, 1.4))
 
-        # Single attribute phrase routes for exact phrase matching
+        # Track D: Exact attribute phrase routes for recent individual constraints
         for _, record in records[-3:]:
             individual = _terms(record["value"], 16)
             if individual:
                 routes.append((individual, "AND", 100, 1.25))
 
-        # Step 3: Execute all routes against SQLite FTS5 and fuse rankings via RRF
-        # Reciprocal Rank Fusion formula: Score += route_weight / (12.0 + rank)
+        # Step 3: Execute FTS queries and combine candidate scores using Reciprocal Rank Fusion (RRF)
         scores: defaultdict[str, float] = defaultdict(float)
         for terms, operator, limit, weight in routes:
             for rank, parent_asin in enumerate(self._search(terms, limit, operator), start=1):
@@ -374,45 +365,70 @@ class ProductRetriever:
 
     def _rerank_score(self, document: ProductDocument, state: dict[str, Any], retrieval_score: float) -> float:
         # Step 1: Base score from multi-route candidate retrieval stage
-        score = retrieval_score * 100.0
+        score = retrieval_score * 80.0
 
+        # Step 2: Attribute and category matching with hierarchical field weighting
         for attribute, record in self._active_records(state):
             value_terms = _terms(record["value"], 40)
-            if not value_terms:
-                continue
-            if attribute == "budget":
-                continue
-            if attribute == "category":
-                field = f"{document.categories} {document.title}"
-                coverage = self._coverage(value_terms, field)
-                if coverage < 1.0:
-                    expanded = _expand_terms(value_terms, 24)
-                    coverage = max(coverage, self._coverage(expanded, field) * 0.9)
-                score += 7.0 * coverage
-                if " ".join(value_terms) in field:
-                    score += 2.0
+            if not value_terms or attribute == "budget":
                 continue
 
-            # Step 2: Cumulative attribute matching & intent override weighting
-            coverage = self._coverage(value_terms, document.combined)
-            if coverage < 1.0:
-                expanded = _expand_terms(value_terms, 24)
-                coverage = max(coverage, self._coverage(expanded, document.combined) * 0.85)
-
-            source_weight = 1.35 if record.get("source") == "override" else 1.0
-            score += source_weight * 10.0 * coverage
+            source_weight = 2.0 if record.get("source") == "override" else 1.0
             normalized_phrase = " ".join(value_terms)
-            if normalized_phrase and normalized_phrase in document.combined:
-                score += source_weight * 7.0
-            if attribute in {"material", "color", "brand"} and coverage >= 1.0:
-                score += source_weight * 3.0
+
+            # 2a. Category matching against categories and title fields
+            if attribute == "category":
+                cat_cov = self._coverage(value_terms, document.categories)
+                title_cov = self._coverage(value_terms, document.title)
+                combined_cat_cov = max(cat_cov * 1.0, title_cov * 0.9)
+                if combined_cat_cov < 1.0:
+                    expanded = _expand_terms(value_terms, 24)
+                    expanded_cat_cov = max(
+                        self._coverage(expanded, document.categories),
+                        self._coverage(expanded, document.title) * 0.9,
+                    )
+                    combined_cat_cov = max(combined_cat_cov, expanded_cat_cov * 0.85)
+
+                score += 10.0 * combined_cat_cov
+                if normalized_phrase in document.categories:
+                    score += 4.0
+                elif normalized_phrase in document.title:
+                    score += 3.0
+                continue
+
+            # 2b. Attribute matching with hierarchical field weighting (title > features/details > description)
+            title_cov = self._coverage(value_terms, document.title)
+            feat_cov = self._coverage(value_terms, f"{document.features} {document.details}")
+            desc_cov = self._coverage(value_terms, document.description)
+
+            if max(title_cov, feat_cov, desc_cov) < 1.0:
+                expanded = _expand_terms(value_terms, 24)
+                title_cov = max(title_cov, self._coverage(expanded, document.title) * 0.9)
+                feat_cov = max(feat_cov, self._coverage(expanded, f"{document.features} {document.details}") * 0.85)
+                desc_cov = max(desc_cov, self._coverage(expanded, document.description) * 0.75)
+
+            field_weighted_coverage = (2.0 * title_cov + 1.5 * feat_cov + 0.8 * desc_cov) / 4.3
+            score += source_weight * 14.0 * field_weighted_coverage
+
+            # 2c. Consecutive exact phrase bonus
+            if normalized_phrase:
+                if normalized_phrase in document.title:
+                    score += source_weight * 6.0
+                elif normalized_phrase in document.features or normalized_phrase in document.details:
+                    score += source_weight * 4.0
+                elif normalized_phrase in document.description:
+                    score += source_weight * 1.5
+
+            # 2d. Key discriminating attribute bonus (material, color, brand, style)
+            if attribute in {"material", "color", "brand", "style"} and max(title_cov, feat_cov) >= 1.0:
+                score += source_weight * 4.0
 
         # Step 3: Heavy penalty for user-rejected / negated terms (e.g. "no wool")
         for excluded in state.get("excluded_terms", []):
             if re.search(rf"\b{re.escape(str(excluded).casefold())}\b", document.combined):
                 score -= 80.0
 
-        # Step 4: Budget & price proximity calculations (maximum vs around)
+        # Step 4: Calibrated budget filtering and price proximity scoring
         for record in state["constraints"].get("budget", []):
             if record.get("status") != "active" or "numeric_value" not in record:
                 continue
@@ -420,12 +436,16 @@ class ProductRetriever:
             if document.price is None:
                 continue
             if record.get("price_mode") == "maximum":
-                score += 7.0 if document.price <= target else -min(20.0, 5.0 + document.price - target)
+                if document.price <= target:
+                    score += 7.0
+                else:
+                    overage = document.price - target
+                    score += max(-25.0, 3.0 - overage * 1.0)
             else:
                 scale = max(5.0, target * 0.25)
                 score += 10.0 * max(0.0, 1.0 - abs(document.price - target) / scale)
 
-        # Step 5: User profile personalization & catalog rating quality
+        # Step 5: Personalization tags and review quality priors
         profile = state.get("user_profile") or {}
         for tag in profile.get("preference_tags", []) or []:
             tag_terms = _terms(tag, 4)
