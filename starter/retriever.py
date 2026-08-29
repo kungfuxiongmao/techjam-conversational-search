@@ -434,16 +434,26 @@ class ProductRetriever:
                 continue
             target = float(record["numeric_value"])
             if document.price is None:
+                score += 1.5
                 continue
+
             if record.get("price_mode") == "maximum":
                 if document.price <= target:
-                    score += 7.0
+                    # Under budget bonus + savings incentive
+                    savings_ratio = max(0.0, (target - document.price) / max(1.0, target))
+                    score += 8.0 + 2.0 * savings_ratio
+                elif document.price <= target * 1.10:
+                    # Mild tolerance margin (10% overage)
+                    overage_ratio = (document.price - target) / (target * 0.10)
+                    score -= 5.0 * overage_ratio
                 else:
-                    overage = document.price - target
-                    score += max(-25.0, 3.0 - overage * 1.0)
+                    # Steep penalty for major budget violations
+                    score -= 35.0 + min(40.0, (document.price - target) * 1.5)
             else:
-                scale = max(5.0, target * 0.25)
-                score += 10.0 * max(0.0, 1.0 - abs(document.price - target) / scale)
+                # Gaussian proximity curve for 'around' mode
+                sigma = max(5.0, target * 0.25)
+                diff = document.price - target
+                score += 12.0 * math.exp(-0.5 * (diff / sigma) ** 2)
 
         # Step 5: Personalization tags and review quality priors
         profile = state.get("user_profile") or {}

@@ -59,6 +59,18 @@ PRODUCTS = [
         "rating_number": 800,
         "store": "Example",
     },
+    {
+        "parent_asin": "NO_PRICE",
+        "title": "Grey Cotton Crew Neck Shirt",
+        "features": ["100% soft cotton"],
+        "description": [],
+        "price": None,
+        "categories": ["Clothing, Shoes & Jewelry", "Men", "Clothing", "Shirts"],
+        "details": {"Color": "Grey"},
+        "average_rating": 4.6,
+        "rating_number": 300,
+        "store": "Example",
+    },
 ]
 
 
@@ -128,6 +140,31 @@ class RetrieverAndAgentTest(unittest.TestCase):
         # TARGET matches both 100% cotton and crew neck in Title and Features, ranking it #1
         self.assertEqual(ranked[0]["parent_asin"], "TARGET")
 
+    def test_retriever_hard_budget_filtering(self) -> None:
+        retriever = ProductRetriever(self.catalog_path)
+        state = new_buyer_state("s", {})
+        update_buyer_state(state, "I want Men Shirts with price under 30 dollars", 1)
+        ranked = retriever.recommend(state, 4)
+        # Products <= $30 should be prioritized ahead of WOOL ($70.00)
+        self.assertIn(ranked[0]["parent_asin"], {"TARGET", "WHITE"})
+        self.assertEqual(ranked[-1]["parent_asin"], "WOOL")
+
+    def test_retriever_soft_budget_proximity(self) -> None:
+        retriever = ProductRetriever(self.catalog_path)
+        state = new_buyer_state("s", {})
+        update_buyer_state(state, "I want Men Shirts around 25 dollars", 1)
+        ranked = retriever.recommend(state, 4)
+        # Products with prices near $25 receive proximity bonuses over $70
+        self.assertIn(ranked[0]["parent_asin"], {"TARGET", "WHITE"})
+
+    def test_retriever_handles_missing_price_gracefully(self) -> None:
+        retriever = ProductRetriever(self.catalog_path)
+        state = new_buyer_state("s", {})
+        update_buyer_state(state, "I want grey cotton shirt", 1)
+        ranked = retriever.recommend(state, 4)
+        # NO_PRICE product (price: None) is properly scored and recommended #1
+        self.assertEqual(ranked[0]["parent_asin"], "NO_PRICE")
+
     def test_agent_returns_valid_contract_and_tracks_question(self) -> None:
         agent = Agent(self.catalog_path)
         agent.reset("session", {"preference_tags": ["comfort"]})
@@ -136,7 +173,7 @@ class RetrieverAndAgentTest(unittest.TestCase):
         )
         self.assertIsInstance(response["message"], str)
         self.assertEqual(response["ask_attribute"], "other")
-        self.assertEqual(len(response["recommendations"]), 4)
+        self.assertEqual(len(response["recommendations"]), len(PRODUCTS))
         self.assertEqual(response["usage"], {"prompt_tokens": 0, "completion_tokens": 0})
         self.assertEqual(agent.tracker.get("session")["asked_attributes"], ["other"])
 
