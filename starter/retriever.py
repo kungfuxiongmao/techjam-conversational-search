@@ -169,6 +169,8 @@ class ProductRetriever:
         return records
 
     def _candidate_scores(self, state: dict[str, Any]) -> dict[str, float]:
+        """Generate an initial candidate pool of products using multi-route search and score fusion."""
+        # Step 1: Extract active category and clue terms from Agent 1's state
         constraints = active_constraints(state)
         category_terms = _terms(constraints.get("category", []), 24)
         records = [
@@ -176,29 +178,40 @@ class ProductRetriever:
             for attribute, record in self._active_records(state)
             if attribute not in {"category", "budget"}
         ]
+        # Sort records chronologically by turn and confidence
         records.sort(key=lambda item: (int(item[1].get("turn", 0)), float(item[1].get("confidence", 0.0))))
         clue_terms = _terms([record["value"] for _, record in records], 48)
         latest_terms = _terms([record["value"] for _, record in records[-2:]], 32)
 
+        # Step 2: Define parallel search routes with tailored operators, limits, and importance weights
+        # Route schema: (terms_list, boolean_operator, candidate_limit, route_weight)
         routes: list[tuple[list[str], str, int, float]] = []
+        # Route A: Broad Category + Clues (OR) -> ensures wide coverage / recall
         if category_terms or clue_terms:
             routes.append((category_terms + clue_terms, "OR", 350, 1.0))
+        # Route B: Strict Category + Clues (AND) -> highest precision route when target has both
         if category_terms and clue_terms:
             # Simulator clues are copied from the target metadata, so the strict
             # category-plus-clue route is high precision even for generic facts.
             routes.append((category_terms + clue_terms[:32], "AND", 220, 2.2))
+        # Route C: All Clue attributes combined (AND) -> matches multi-attribute combinations
         if clue_terms:
             routes.append((clue_terms[:24], "AND", 180, 1.8))
+        # Route D: Focus on the latest revealed facts (AND & OR) -> fast adaptation to new turns
         if latest_terms:
             routes.append((latest_terms, "AND", 180, 1.6))
             routes.append((latest_terms, "OR", 220, 1.1))
+        # Route E: Category-only fallback route (OR)
         if category_terms:
             routes.append((category_terms, "OR", 220, 0.55))
+        # Route F: Individual attribute phrases (AND) -> ensures specific phrases get matched
         for _, record in records[-4:]:
             individual = _terms(record["value"], 20)
             if individual:
                 routes.append((individual, "AND", 100, 1.25))
 
+        # Step 3: Execute all routes against SQLite FTS5 and fuse rankings via RRF
+        # Reciprocal Rank Fusion formula: Score += route_weight / (12.0 + rank)
         scores: defaultdict[str, float] = defaultdict(float)
         for terms, operator, limit, weight in routes:
             for rank, parent_asin in enumerate(self._search(terms, limit, operator), start=1):
@@ -213,8 +226,11 @@ class ProductRetriever:
         return sum(term in text_terms for term in terms) / len(terms)
 
     def _rerank_score(self, document: ProductDocument, state: dict[str, Any], retrieval_score: float) -> float:
+        # Set base candidate score
         score = retrieval_score * 100.0
+
         for attribute, record in self._active_records(state):
+            # Match categories
             value_terms = _terms(record["value"], 40)
             if not value_terms:
                 continue
@@ -227,9 +243,10 @@ class ProductRetriever:
                 if " ".join(value_terms) in field:
                     score += 2.0
                 continue
-
+            
+            # Match attributes & Manage intent override
             coverage = self._coverage(value_terms, document.combined)
-            source_weight = 1.35 if record.get("source") == "override" else 1.0
+            source_weight = 1.35 if record.get("source") == "override" else 1.0 # intent override
             score += source_weight * 10.0 * coverage
             normalized_phrase = " ".join(value_terms)
             if normalized_phrase and normalized_phrase in document.combined:
@@ -237,10 +254,12 @@ class ProductRetriever:
             if attribute in {"material", "color", "brand"} and coverage == 1.0:
                 score += source_weight * 3.0
 
+        # Penalty for excluded terms
         for excluded in state.get("excluded_terms", []):
             if re.search(rf"\b{re.escape(str(excluded).casefold())}\b", document.combined):
                 score -= 80.0
 
+        # Scoring by Budget and Price Proximity
         for record in state["constraints"].get("budget", []):
             if record.get("status") != "active" or "numeric_value" not in record:
                 continue
@@ -253,6 +272,7 @@ class ProductRetriever:
                 scale = max(5.0, target * 0.25)
                 score += 10.0 * max(0.0, 1.0 - abs(document.price - target) / scale)
 
+        # Personalise by user profile
         profile = state.get("user_profile") or {}
         for tag in profile.get("preference_tags", []) or []:
             tag_terms = _terms(tag, 4)
@@ -264,9 +284,19 @@ class ProductRetriever:
         return score
 
     def _category_fallback(self, state: dict[str, Any], needed: int, seen: set[str]) -> list[str]:
+        """
+        Safety fallback to guarantee returning 10 catalog-valid recommendations.
+        
+        If specific searches return fewer than 10 items (e.g. Turn 1 with vague clues),
+        this fills the remaining slots using:
+        1. Broader category searches from the active category terms.
+        2. Precomputed popular/high-rated products in the catalog.
+        """
         categories = active_constraints(state).get("category", [])
         category_terms = _terms(categories, 24)
         result: list[str] = []
+
+        # Fallback Level 1: Broader category matches
         if category_terms:
             for parent_asin in self._search(category_terms, max(needed * 8, 80), "OR"):
                 if parent_asin not in seen:
@@ -274,6 +304,8 @@ class ProductRetriever:
                     result.append(parent_asin)
                     if len(result) >= needed:
                         return result
+        
+        # Fallback Level 2: Top popular/high-rated catalog items
         for parent_asin in self._popular:
             if parent_asin not in seen:
                 seen.add(parent_asin)
@@ -284,7 +316,9 @@ class ProductRetriever:
 
     def recommend(self, state: dict[str, Any], top_k: int = 10) -> list[dict[str, str]]:
         limit = max(1, min(int(top_k), 10))
+        # Multi-route candidate generation
         retrieval_scores = self._candidate_scores(state)
+        # Reranking based on context
         ranked = sorted(
             retrieval_scores,
             key=lambda asin: (self._rerank_score(self.documents[asin], state, retrieval_scores[asin]), asin),
@@ -293,5 +327,6 @@ class ProductRetriever:
         selected = ranked[:limit]
         seen = set(selected)
         if len(selected) < limit:
+            # Fallback if < 10 items
             selected.extend(self._category_fallback(state, limit - len(selected), seen))
         return [{"parent_asin": parent_asin} for parent_asin in selected]
