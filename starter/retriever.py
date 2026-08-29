@@ -178,6 +178,30 @@ def _expand_terms(terms: Iterable[str], limit: int = 36) -> list[str]:
 
 
 @dataclass(frozen=True)
+class RetrieverConfig:
+    """Hyperparameters governing candidate generation and reranking utility curves.
+    
+    Attributes:
+        base_retrieval_multiplier: Scaling factor for candidate RRF scores into reranker base.
+        rrf_k: Reciprocal Rank Fusion rank dampening constant (default: 12.0).
+        category_match_scale: Maximum points awarded for full category field coverage.
+        attribute_match_scale: Maximum base scale for field-weighted attribute coverage.
+        phrase_bonus_scale: Multiplier for exact consecutive multi-word phrase matches.
+        hard_budget_tolerance: Fractional overage allowed before steep budget penalties (0.10 = 10%).
+        budget_penalty_slope: Linear slope applied to overage beyond the tolerance margin.
+        negation_penalty: Fixed score penalty applied to items containing user-rejected terms.
+    """
+    base_retrieval_multiplier: float = 40.0
+    rrf_k: float = 12.0
+    category_match_scale: float = 12.0
+    attribute_match_scale: float = 16.0
+    phrase_bonus_scale: float = 3.5
+    hard_budget_tolerance: float = 0.10
+    budget_penalty_slope: float = 1.5
+    negation_penalty: float = 80.0
+
+
+@dataclass(frozen=True)
 class ProductDocument:
     parent_asin: str
     title: str
@@ -193,13 +217,27 @@ class ProductDocument:
 
 
 class ProductRetriever:
-    """Offline FTS candidate generation followed by deterministic reranking."""
+    """Offline FTS candidate generation followed by deterministic reranking.
+    
+    Calculates dynamic BM25F field signal densities and vocabulary document frequencies (IDF)
+    at catalog load time to replace hardcoded field and term importance weights with mathematically
+    grounded information-theoretic values:
+    
+    1. Field Saliency (BM25F):
+       W_field = 3.0 * (1 / sqrt(avg_len(field))) / sum_f (1 / sqrt(avg_len(f)))
+       
+    2. Term Specificity (IDF):
+       IDF(t) = ln(1.0 + N / (DF(t) + 1))
+    """
 
-    def __init__(self, catalog_path: str | Path) -> None:
+    def __init__(self, catalog_path: str | Path, config: RetrieverConfig | None = None) -> None:
         self.catalog_path = Path(catalog_path)
+        self.config = config or RetrieverConfig()
         self.connection = sqlite3.connect(":memory:")
         self.documents: dict[str, ProductDocument] = {}
         self._popular: list[str] = []
+        self.doc_freq: dict[str, int] = defaultdict(int)
+        self.field_weights: dict[str, float] = {"title": 1.5, "features": 0.8, "description": 0.7}
         self._build_index()
 
     def _build_index(self) -> None:
@@ -210,6 +248,11 @@ class ProductRetriever:
             "tokenize='porter unicode61 remove_diacritics 2')"
         )
         batch: list[tuple[str, str, str, str, str, str, str]] = []
+        doc_count = 0
+        total_title_tokens = 0
+        total_feat_tokens = 0
+        total_desc_tokens = 0
+
         with self.catalog_path.open(encoding="utf-8") as handle:
             for line in handle:
                 if not line.strip():
@@ -225,6 +268,21 @@ class ProductRetriever:
                 combined = _normal_text(" ".join((title, categories, features, details, store, description)))
                 rating = product.get("average_rating")
                 rating_number = product.get("rating_number")
+
+                doc_count += 1
+                t_terms = TOKEN_RE.findall(title.casefold())
+                f_terms = TOKEN_RE.findall(features.casefold())
+                d_terms = TOKEN_RE.findall(description.casefold())
+                total_title_tokens += len(t_terms)
+                total_feat_tokens += len(f_terms)
+                total_desc_tokens += len(d_terms)
+
+                # Track document frequency for vocabulary terms
+                seen_in_doc = set(t_terms) | set(f_terms)
+                for term in seen_in_doc:
+                    if term not in STOPWORDS and len(term) > 1:
+                        self.doc_freq[term] += 1
+
                 document = ProductDocument(
                     parent_asin=parent_asin,
                     title=_normal_text(title),
@@ -246,6 +304,25 @@ class ProductRetriever:
         if batch:
             cursor.executemany("INSERT INTO product_fts VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
+
+        # Compute dynamic field weights via BM25F field-length normalization:
+        # W_field = 3.0 * (1 / sqrt(avg_len(field))) / sum_f (1 / sqrt(avg_len(f)))
+        if doc_count > 0:
+            avg_title = max(6.0, total_title_tokens / doc_count)
+            avg_feat = max(18.0, total_feat_tokens / doc_count)
+            avg_desc = max(24.0, total_desc_tokens / doc_count)
+
+            raw_t = 1.0 / math.sqrt(avg_title)
+            raw_f = 1.0 / math.sqrt(avg_feat)
+            raw_d = 1.0 / math.sqrt(avg_desc)
+            total_raw = raw_t + raw_f + raw_d
+
+            self.field_weights = {
+                "title": (raw_t / total_raw) * 3.0,
+                "features": (raw_f / total_raw) * 3.0,
+                "description": (raw_d / total_raw) * 3.0,
+            }
+
         self._popular = sorted(
             self.documents,
             key=lambda asin: (
@@ -255,6 +332,29 @@ class ProductRetriever:
             ),
             reverse=True,
         )
+
+    def _idf(self, term: str) -> float:
+        """Calculates smoothed Inverse Document Frequency for term specificity:
+        
+        IDF(t) = ln(1.0 + N / (DF(t) + 1))
+        """
+        doc_count = max(1, len(self.documents))
+        df = self.doc_freq.get(term, 1)
+        return math.log(1.0 + doc_count / (df + 1))
+
+    def _constraint_salience(self, record: dict[str, Any], terms: list[str]) -> float:
+        """Dynamically computes constraint salience from term IDF, turn confidence, and override source:
+        
+        Salience = Override_Multiplier * Confidence * Specificity(IDF)
+        """
+        if not terms:
+            return 1.0
+        idfs = [self._idf(t) for t in terms]
+        avg_idf = sum(idfs) / len(idfs)
+        specificity = max(0.7, min(1.8, avg_idf / 2.5))
+        confidence = float(record.get("confidence", 1.0))
+        override_mult = 2.0 if record.get("source") == "override" else 1.0
+        return override_mult * confidence * specificity
 
     @staticmethod
     def _expression(terms: Iterable[str], operator: str = "OR") -> str:
@@ -351,7 +451,7 @@ class ProductRetriever:
         scores: defaultdict[str, float] = defaultdict(float)
         for terms, operator, limit, weight in routes:
             for rank, parent_asin in enumerate(self._search(terms, limit, operator), start=1):
-                scores[parent_asin] += weight / (12.0 + rank)
+                scores[parent_asin] += weight / (self.config.rrf_k + rank)
         return dict(scores)
 
     @staticmethod
@@ -365,7 +465,7 @@ class ProductRetriever:
 
     def _rerank_score(self, document: ProductDocument, state: dict[str, Any], retrieval_score: float) -> float:
         # Step 1: Base score from multi-route candidate retrieval stage
-        score = retrieval_score * 80.0
+        score = retrieval_score * self.config.base_retrieval_multiplier
 
         # Step 2: Attribute and category matching with hierarchical field weighting
         for attribute, record in self._active_records(state):
@@ -373,7 +473,7 @@ class ProductRetriever:
             if not value_terms or attribute == "budget":
                 continue
 
-            source_weight = 2.0 if record.get("source") == "override" else 1.0
+            salience = self._constraint_salience(record, value_terms)
             normalized_phrase = " ".join(value_terms)
 
             # 2a. Category matching against categories and title fields
@@ -389,14 +489,14 @@ class ProductRetriever:
                     )
                     combined_cat_cov = max(combined_cat_cov, expanded_cat_cov * 0.85)
 
-                score += 10.0 * combined_cat_cov
+                score += self.config.category_match_scale * combined_cat_cov
                 if normalized_phrase in document.categories:
                     score += 4.0
                 elif normalized_phrase in document.title:
                     score += 3.0
                 continue
 
-            # 2b. Attribute matching with hierarchical field weighting (title > features/details > description)
+            # 2b. Attribute matching with dynamic BM25F field weighting (Title > Features > Description)
             title_cov = self._coverage(value_terms, document.title)
             feat_cov = self._coverage(value_terms, f"{document.features} {document.details}")
             desc_cov = self._coverage(value_terms, document.description)
@@ -407,26 +507,31 @@ class ProductRetriever:
                 feat_cov = max(feat_cov, self._coverage(expanded, f"{document.features} {document.details}") * 0.85)
                 desc_cov = max(desc_cov, self._coverage(expanded, document.description) * 0.75)
 
-            field_weighted_coverage = (2.0 * title_cov + 1.5 * feat_cov + 0.8 * desc_cov) / 4.3
-            score += source_weight * 14.0 * field_weighted_coverage
+            # Normalized by the sum of dynamic field weights (3.0)
+            field_weighted_coverage = (
+                self.field_weights["title"] * title_cov +
+                self.field_weights["features"] * feat_cov +
+                self.field_weights["description"] * desc_cov
+            ) / 3.0
+            score += salience * self.config.attribute_match_scale * field_weighted_coverage
 
             # 2c. Consecutive exact phrase bonus
             if normalized_phrase:
                 if normalized_phrase in document.title:
-                    score += source_weight * 6.0
+                    score += salience * self.config.phrase_bonus_scale * self.field_weights["title"]
                 elif normalized_phrase in document.features or normalized_phrase in document.details:
-                    score += source_weight * 4.0
+                    score += salience * self.config.phrase_bonus_scale * self.field_weights["features"]
                 elif normalized_phrase in document.description:
-                    score += source_weight * 1.5
+                    score += salience * self.config.phrase_bonus_scale * self.field_weights["description"]
 
             # 2d. Key discriminating attribute bonus (material, color, brand, style)
             if attribute in {"material", "color", "brand", "style"} and max(title_cov, feat_cov) >= 1.0:
-                score += source_weight * 4.0
+                score += salience * 4.0
 
         # Step 3: Heavy penalty for user-rejected / negated terms (e.g. "no wool")
         for excluded in state.get("excluded_terms", []):
             if re.search(rf"\b{re.escape(str(excluded).casefold())}\b", document.combined):
-                score -= 80.0
+                score -= self.config.negation_penalty
 
         # Step 4: Calibrated budget filtering and price proximity scoring
         for record in state["constraints"].get("budget", []):
@@ -442,13 +547,13 @@ class ProductRetriever:
                     # Under budget bonus + savings incentive
                     savings_ratio = max(0.0, (target - document.price) / max(1.0, target))
                     score += 8.0 + 2.0 * savings_ratio
-                elif document.price <= target * 1.10:
-                    # Mild tolerance margin (10% overage)
-                    overage_ratio = (document.price - target) / (target * 0.10)
+                elif document.price <= target * (1.0 + self.config.hard_budget_tolerance):
+                    # Mild tolerance margin
+                    overage_ratio = (document.price - target) / (target * self.config.hard_budget_tolerance)
                     score -= 5.0 * overage_ratio
                 else:
                     # Steep penalty for major budget violations
-                    score -= 35.0 + min(40.0, (document.price - target) * 1.5)
+                    score -= 35.0 + min(40.0, (document.price - target) * self.config.budget_penalty_slope)
             else:
                 # Gaussian proximity curve for 'around' mode
                 sigma = max(5.0, target * 0.25)
