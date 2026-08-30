@@ -14,6 +14,7 @@ from starter.tracker import active_constraints
 
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+HYPHEN_PREFIX_RE = re.compile(r"\b([a-z0-9]{1,4})-([a-z0-9]+)\b", re.IGNORECASE)
 STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
     "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "some",
@@ -32,14 +33,23 @@ def _flatten(value: object) -> str:
     return str(value)
 
 
+def _normalize_compounds(text: str) -> str:
+    """Normalizes hyphenated compounds (e.g. 't-shirt' -> 'tshirt t-shirt shirt', 'v-neck' -> 'vneck v-neck neck')."""
+    def repl(m: re.Match) -> str:
+        p1, p2 = m.group(1), m.group(2)
+        return f"{p1}{p2} {p1} {p2}"
+    return HYPHEN_PREFIX_RE.sub(repl, text)
+
+
 def _normal_text(value: object) -> str:
-    return " ".join(TOKEN_RE.findall(_flatten(value).casefold()))
+    return " ".join(TOKEN_RE.findall(_normalize_compounds(_flatten(value).casefold())))
 
 
 def _terms(value: object, limit: int = 48) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
-    for token in TOKEN_RE.findall(_flatten(value).casefold()):
+    cleaned = _normalize_compounds(_flatten(value).casefold())
+    for token in TOKEN_RE.findall(cleaned):
         if len(token) <= 1 or token in STOPWORDS or token in seen:
             continue
         seen.add(token)
@@ -64,6 +74,7 @@ def _numeric_price(value: object) -> float | None:
 
 try:
     import nltk
+    from nltk.corpus import wordnet as wn
     from nltk.stem import PorterStemmer, WordNetLemmatizer
 
     _local_nltk_dir = Path(__file__).resolve().parent.parent / ".venv" / "nltk_data"
@@ -72,9 +83,11 @@ try:
 
     _STEMMER: PorterStemmer | None = PorterStemmer()
     _LEMMATIZER: WordNetLemmatizer | None = WordNetLemmatizer()
+    _WN = wn
 except ImportError:
     _STEMMER = None
     _LEMMATIZER = None
+    _WN = None
 
 
 @functools.lru_cache(maxsize=16384)
@@ -113,48 +126,62 @@ def _stem_word(word: str) -> str:
     return w
 
 
-SYNONYM_MAP: dict[str, tuple[str, ...]] = {
-    # Footwear
-    "sneaker": ("shoe", "running", "athletic", "trainer", "footwear"),
-    "shoe": ("footwear", "sneaker"),
-    "boot": ("footwear", "ankle", "hiking"),
-    "sandal": ("slide", "open", "toe", "flip", "flop"),
-    "heel": ("pump", "stiletto"),
-    # Tops & Shirts
-    "tee": ("t-shirt", "shirt", "top"),
-    "t-shirt": ("tee", "shirt", "top"),
-    "tshirt": ("t-shirt", "tee", "shirt", "top"),
-    "shirt": ("top", "tee", "blouse", "button"),
-    "hoodie": ("sweatshirt", "pullover", "hooded"),
-    "sweatshirt": ("hoodie", "pullover", "fleece", "crewneck"),
-    "sweater": ("knit", "pullover", "cardigan"),
-    # Outerwear
-    "jacket": ("coat", "outerwear", "windbreaker", "parka"),
-    "coat": ("jacket", "outerwear", "parka", "overcoat"),
-    # Bottoms
-    "jeans": ("denim", "pants", "trousers"),
-    "pants": ("trousers", "slacks", "jeans", "chinos"),
-    "shorts": ("trunks", "bermuda"),
-    "leggings": ("tights", "pants", "yoga"),
-    # Jewelry
-    "jewelry": ("ring", "necklace", "earring", "bracelet"),
-    "earring": ("stud", "hoop", "dangle"),
-    "necklace": ("pendant", "chain", "choker"),
-    "bracelet": ("bangle", "cuff", "wristband"),
-    # Materials
-    "denim": ("jean", "cotton"),
-    "leather": ("genuine", "faux", "pu"),
-    # Styles & Use cases
-    "workout": ("gym", "running", "athletic", "fitness"),
-    "running": ("athletic", "workout", "training", "shoe"),
-    "hiking": ("outdoor", "trail", "trekking", "boot"),
-    "winter": ("warm", "thermal", "fleece"),
-    "summer": ("beach", "lightweight", "breathable"),
-}
+class WordNetSynonymProvider:
+    """Open-vocabulary synonym resolution using NLTK Princeton WordNet.
+    
+    Traverses WordNet's taxonomic synsets for noun artifact, substance, and attribute
+    concepts to provide dynamic, domain-general synonym expansion without requiring
+    hardcoded lexical lookup tables.
+    """
+
+    def __init__(self, wn_corpus: Any = _WN, custom_overlays: dict[str, tuple[str, ...]] | None = None) -> None:
+        self._wn = wn_corpus
+        self._overlays = custom_overlays or {}
+
+    @functools.lru_cache(maxsize=8192)
+    def synonyms(self, word: str, limit: int = 4) -> tuple[str, ...]:
+        syns: list[str] = []
+        seen: set[str] = {word}
+
+        # 1. Dynamic open-vocabulary WordNet synsets
+        if self._wn is not None:
+            try:
+                for syn in self._wn.synsets(word, pos="n"):
+                    lexname = syn.lexname()
+                    if lexname not in {"noun.artifact", "noun.substance", "noun.attribute"}:
+                        continue
+                    for lemma in syn.lemmas():
+                        clean = lemma.name().replace("_", "-").casefold()
+                        for part in clean.split("-"):
+                            if part not in seen and len(part) > 2 and part not in STOPWORDS:
+                                seen.add(part)
+                                syns.append(part)
+                                if len(syns) >= limit:
+                                    return tuple(syns)
+            except Exception:
+                pass
+
+        # 2. Optional domain overlays (if configured)
+        for overlay in self._overlays.get(word, ()):
+            if overlay not in seen and overlay not in STOPWORDS:
+                seen.add(overlay)
+                syns.append(overlay)
+                if len(syns) >= limit:
+                    break
+
+        return tuple(syns)
 
 
-def _expand_terms(terms: Iterable[str], limit: int = 36) -> list[str]:
-    """Expands query terms with root-word stem matching and domain synonyms."""
+_DEFAULT_SYNONYM_PROVIDER = WordNetSynonymProvider()
+
+
+def _expand_terms(
+    terms: Iterable[str],
+    limit: int = 36,
+    synonym_provider: WordNetSynonymProvider | None = None,
+) -> list[str]:
+    """Expands query terms with root-word stem matching and dynamic WordNet synsets."""
+    provider = synonym_provider or _DEFAULT_SYNONYM_PROVIDER
     result: list[str] = []
     seen: set[str] = set()
     for raw_term in terms:
@@ -167,8 +194,7 @@ def _expand_terms(terms: Iterable[str], limit: int = 36) -> list[str]:
             seen.add(stemmed)
             result.append(stemmed)
 
-        synonyms = SYNONYM_MAP.get(raw_term) or SYNONYM_MAP.get(stemmed) or ()
-        for syn in synonyms:
+        for syn in provider.synonyms(raw_term):
             if syn not in seen and syn not in STOPWORDS:
                 seen.add(syn)
                 result.append(syn)
@@ -230,15 +256,24 @@ class ProductRetriever:
        IDF(t) = ln(1.0 + N / (DF(t) + 1))
     """
 
-    def __init__(self, catalog_path: str | Path, config: RetrieverConfig | None = None) -> None:
+    def __init__(
+        self,
+        catalog_path: str | Path,
+        config: RetrieverConfig | None = None,
+        synonym_provider: WordNetSynonymProvider | None = None,
+    ) -> None:
         self.catalog_path = Path(catalog_path)
         self.config = config or RetrieverConfig()
+        self.synonym_provider = synonym_provider or _DEFAULT_SYNONYM_PROVIDER
         self.connection = sqlite3.connect(":memory:")
         self.documents: dict[str, ProductDocument] = {}
         self._popular: list[str] = []
         self.doc_freq: dict[str, int] = defaultdict(int)
         self.field_weights: dict[str, float] = {"title": 1.5, "features": 0.8, "description": 0.7}
         self._build_index()
+
+    def _expand(self, terms: Iterable[str], limit: int = 36) -> list[str]:
+        return _expand_terms(terms, limit=limit, synonym_provider=self.synonym_provider)
 
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
@@ -389,7 +424,7 @@ class ProductRetriever:
         # Step 1: Extract active category and clue terms from dialogue state
         constraints = active_constraints(state)
         category_terms = _terms(constraints.get("category", []), 24)
-        expanded_category_terms = _expand_terms(category_terms, 32)
+        expanded_category_terms = self._expand(category_terms, 32)
         records = [
             (attribute, record)
             for attribute, record in self._active_records(state)
@@ -482,7 +517,7 @@ class ProductRetriever:
                 title_cov = self._coverage(value_terms, document.title)
                 combined_cat_cov = max(cat_cov * 1.0, title_cov * 0.9)
                 if combined_cat_cov < 1.0:
-                    expanded = _expand_terms(value_terms, 24)
+                    expanded = self._expand(value_terms, 24)
                     expanded_cat_cov = max(
                         self._coverage(expanded, document.categories),
                         self._coverage(expanded, document.title) * 0.9,
@@ -502,7 +537,7 @@ class ProductRetriever:
             desc_cov = self._coverage(value_terms, document.description)
 
             if max(title_cov, feat_cov, desc_cov) < 1.0:
-                expanded = _expand_terms(value_terms, 24)
+                expanded = self._expand(value_terms, 24)
                 title_cov = max(title_cov, self._coverage(expanded, document.title) * 0.9)
                 feat_cov = max(feat_cov, self._coverage(expanded, f"{document.features} {document.details}") * 0.85)
                 desc_cov = max(desc_cov, self._coverage(expanded, document.description) * 0.75)
@@ -575,7 +610,7 @@ class ProductRetriever:
         """Safety fallback to guarantee returning 10 catalog-valid recommendations."""
         categories = active_constraints(state).get("category", [])
         category_terms = _terms(categories, 24)
-        expanded_terms = _expand_terms(category_terms, 32)
+        expanded_terms = self._expand(category_terms, 32)
         result: list[str] = []
         
         # Fallback Level 1: Broader category matches (with synonyms)
