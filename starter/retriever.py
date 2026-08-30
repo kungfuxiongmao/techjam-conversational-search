@@ -559,9 +559,11 @@ class ProductRetriever:
                 elif normalized_phrase in document.description:
                     score += salience * self.config.phrase_bonus_scale * self.field_weights["description"]
 
-            # 2d. Key discriminating attribute bonus (material, color, brand, style)
-            if attribute in {"material", "color", "brand", "style"} and max(title_cov, feat_cov) >= 1.0:
-                score += salience * 4.0
+            # 2d. Information-theoretic exact coverage bonus (self-calibrating via IDF)
+            if max(title_cov, feat_cov) >= 1.0:
+                max_idf = max((self._idf(t) for t in value_terms), default=2.5)
+                specificity_bonus = min(4.0, max(1.5, max_idf * 0.8))
+                score += salience * specificity_bonus
 
         # Step 3: Heavy penalty for user-rejected / negated terms (e.g. "no wool")
         for excluded in state.get("excluded_terms", []):
