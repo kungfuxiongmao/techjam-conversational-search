@@ -1,3 +1,4 @@
+"""Product Retriever & Ranker for Cotton Sheep (棉羊) Conversational Search Assistant."""
 from __future__ import annotations
 
 import functools

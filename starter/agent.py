@@ -7,7 +7,9 @@ from starter.tracker import BuyerStateTracker, choose_next_question
 
 
 class Agent:
-    """Stateful, deterministic conversational product-search agent."""
+    """Cotton Sheep (棉羊): Stateful, deterministic conversational search agent connecting the
+    Dialogue State Tracker and Product Retriever & Ranker.
+    """
 
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         self.catalog_path = Path(catalog_path)

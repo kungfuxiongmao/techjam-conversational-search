@@ -80,11 +80,8 @@ def run_local_evaluator() -> dict | None:
 def _progress_bar(value: float, total: float = 1.0, length: int = 20) -> str:
     fraction = max(0.0, min(1.0, value / total if total > 0 else 0.0))
     filled = int(round(fraction * length))
-    bar = "█" * filled + "░" * (length - filled)
     return f"[{bar}] {fraction * 100:>5.1f}%"
 
-
-def format_human_report(current: dict) -> None:
     baseline = {}
     if BASELINE_PATH.exists():
         with open(BASELINE_PATH, "r", encoding="utf-8") as f:
@@ -106,7 +103,6 @@ def format_human_report(current: dict) -> None:
     sample_count = current.get("sample_count", 200)
 
     print("\n" + "=" * 65)
-    print("🏆  TECHJAM EVALUATION SCORECARD")
     print("=" * 65)
     print(f" Total Sessions Evaluated: {sample_count}")
     print(f" Overall Technical Score : {tech_score:.4f} / 1.0000  {_progress_bar(tech_score)}")
@@ -181,7 +177,6 @@ def format_human_report(current: dict) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TechJam Testing & Benchmark Suite")
     parser.add_argument(
         "--eval",
         "-e",

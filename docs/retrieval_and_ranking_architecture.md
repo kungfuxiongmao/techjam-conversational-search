@@ -1,4 +1,4 @@
-# Agent 2: Product Retriever & Ranker Architecture Document
+# Cotton Sheep (棉羊): Product Retriever & Ranker Architecture Document
 **TechJam Conversational Search Hackathon**  
 *Technical Architecture, Mathematical Foundations, and Algorithmic Specifications*
 
@@ -6,9 +6,10 @@
 
 ## 1. Executive Summary & System Philosophy
 
-Agent 2 (`ProductRetriever` in `starter/retriever.py`) is a **high-throughput, zero-LLM-cost, deterministic conversational retrieval and reranking engine**.
+The **Product Retriever & Ranker** (`ProductRetriever` in `starter/retriever.py`) is a **high-throughput, zero-LLM-cost, deterministic conversational retrieval and reranking engine**.
 
-Designed specifically for interactive dialogue with conversational buyers across varying intents (buying, broad exploratory browsing, mid-dialogue preference overrides, and negative constraints), Agent 2 implements a **two-stage Information Retrieval (IR) architecture**:
+Designed specifically for interactive dialogue with conversational buyers across diverse shopping scenarios (buying, broad exploratory browsing, mid-dialogue preference overrides, and boundary constraints), the Product Retriever & Ranker implements a **two-stage Information Retrieval (IR) architecture**:
+
 
 ```mermaid
 flowchart TD

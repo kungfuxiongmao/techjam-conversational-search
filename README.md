@@ -1,4 +1,4 @@
-# 棉羊网购搜索助理
+# 棉羊 ("Cotton Sheep") — Conversational E-Commerce Search Assistant
 **High-Precision, Zero-LLM-Cost Multi-Turn Conversational Product Discovery**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
@@ -10,7 +10,7 @@
 
 ## 1. Project Overview
 
-This repository contains an end-to-end, deterministic conversational shopping assistant developed for the **TechJam Conversational E-Commerce Search Challenge**.
+This repository contains an end-to-end, deterministic conversational shopping assistant named **棉羊 ("Cotton Sheep")** developed for the **TechJam Conversational E-Commerce Search Challenge**.
 
 The system is evaluated against a frozen catalog of **50,000 fashion products** (derived from the *Amazon Reviews 2023: Clothing, Shoes, and Jewelry* dataset). Over multi-turn interactive dialogues across diverse buyer scenarios (**Buying, Exploratory Browsing, Mid-Dialogue Intent Override, and Boundary Conditions**), the assistant asks targeted clarification questions while returning a ranked Top-10 recommendation list to identify the customer hidden target product within $\le 10$ turns.
 
@@ -268,14 +268,20 @@ While our deterministic search system is ultra-fast (sub-2ms response time) and 
 ├── DATA_ATTRIBUTION.md                        <- Dataset source attribution (Amazon Reviews 2023)
 ├── requirements.txt                           <- Python dependencies
 ├── data/
+│   ├── README.md                              <- Catalog schema & dataset description
 │   ├── catalog.jsonl                          <- 50,000 product catalog (FTS5 indexed)
 │   └── public_set.jsonl                       <- 200 labeled evaluation sessions
 ├── docs/
 │   ├── challenge_readme.md                    <- Original challenge specification README
-│   ├── retrieval_and_ranking_architecture.md  <- Retriever mathematical specification
-│   ├── competition_specification.md           <- Official hackathon rules
+│   ├── retrieval_and_ranking_architecture.md  <- Product Retriever & Ranker mathematical specification
+│   ├── summary-search.md                      <- Dialogue State Tracker technical overview
+│   ├── competition_specification.md           <- Official hackathon rules & scoring metric formulations
+│   ├── submission_rules.md                    <- Packaging and submission requirements
 │   ├── agent_api_contract.json                <- Agent API JSON schema
+│   ├── evaluation_config.json                 <- Metric parameters & scoring weights
 │   └── baseline_results.json                  <- Baseline reference scores
+├── evaluator/
+│   └── local_evaluator.py                     <- Official local evaluation harness
 ├── starter/
 │   ├── agent.py                               <- Agent entrypoint connecting Tracker and Retriever
 │   ├── tracker.py                             <- Dialogue State Tracker & slot extraction
