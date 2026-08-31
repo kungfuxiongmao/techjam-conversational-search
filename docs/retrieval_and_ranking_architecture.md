@@ -103,16 +103,21 @@ Where:
 Buyer budget preferences are modeled using continuous, differentiable utility curves to prevent arbitrary step-function drop-offs:
 
 #### 1. Hard Budget (`price_mode == "maximum"`):
-$$U_{\text{max}}(\text{price}, \text{target}) = \begin{cases} 
-+8.0 + 2.0 \cdot \left(\frac{\text{target} - \text{price}}{\text{target}}\right) & \text{if } \text{price} \le \text{target} \text{ (Under-budget savings bonus)} \\
--5.0 \cdot \left(\frac{\text{price} - \text{target}}{0.10 \cdot \text{target}}\right) & \text{if } \text{target} < \text{price} \le 1.10 \cdot \text{target} \text{ (10% tolerance margin)} \\
--35.0 - 1.5 \cdot (\text{price} - \text{target}) & \text{if } \text{price} > 1.10 \cdot \text{target} \text{ (Steep violation penalty)}
-\end{cases}$$
+
+$$
+U_{\text{max}}(\text{price}, \text{target}) = \begin{cases} 
++8.0 + 2.0 \cdot \left(\frac{\text{target} - \text{price}}{\text{target}}\right) & \text{if } \text{price} \le \text{target} \\
+-5.0 \cdot \left(\frac{\text{price} - \text{target}}{0.10 \cdot \text{target}}\right) & \text{if } \text{target} < \text{price} \le 1.10 \cdot \text{target} \\
+-35.0 - 1.5 \cdot (\text{price} - \text{target}) & \text{if } \text{price} > 1.10 \cdot \text{target}
+\end{cases}
+$$
 
 #### 2. Soft Target (`price_mode == "around"`):
 Modeled via a continuous **Gaussian Proximity Kernel**:
 
-$$U_{\text{around}}(\text{price}, \text{target}) = 12.0 \times \exp\left( -0.5 \left(\frac{\text{price} - \text{target}}{\sigma}\right)^2 \right), \quad \sigma = \max(5.0, \, 0.25 \cdot \text{target})$$
+$$
+U_{\text{around}}(\text{price}, \text{target}) = 12.0 \times \exp\left( -0.5 \left(\frac{\text{price} - \text{target}}{\sigma}\right)^2 \right), \quad \sigma = \max(5.0, \, 0.25 \cdot \text{target})
+$$
 
 ---
 

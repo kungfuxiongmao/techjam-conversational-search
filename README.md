@@ -1,4 +1,4 @@
-# TechJam Conversational E-Commerce Search Assistant
+# 棉羊网购搜索助理
 **High-Precision, Zero-LLM-Cost Multi-Turn Conversational Product Discovery**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
@@ -115,13 +115,20 @@ Uses `WordNetSynonymProvider` to dynamically look up synonyms and related clothi
 
 #### 6. Continuous Price & Budget Utility Curves
 * **Maximum Budget**: Rewards items under budget and applies smooth penalties with a 10% soft tolerance window:
-  $$U_{\text{max}}(\text{price}, \text{target}) = \begin{cases} 
-  +8.0 + 2.0 \cdot \left(\frac{\text{target} - \text{price}}{\text{target}}\right) & \text{if } \text{price} \le \text{target} \\
-  -5.0 \cdot \left(\frac{\text{price} - \text{target}}{0.10 \cdot \text{target}}\right) & \text{if } \text{target} < \text{price} \le 1.10 \cdot \text{target} \\
-  -35.0 - 1.5 \cdot (\text{price} - \text{target}) & \text{if } \text{price} > 1.10 \cdot \text{target}
-  \end{cases}$$
+
+$$
+U_{\text{max}}(\text{price}, \text{target}) = \begin{cases} 
++8.0 + 2.0 \cdot \left(\frac{\text{target} - \text{price}}{\text{target}}\right) & \text{if } \text{price} \le \text{target} \\
+-5.0 \cdot \left(\frac{\text{price} - \text{target}}{0.10 \cdot \text{target}}\right) & \text{if } \text{target} < \text{price} \le 1.10 \cdot \text{target} \\
+-35.0 - 1.5 \cdot (\text{price} - \text{target}) & \text{if } \text{price} > 1.10 \cdot \text{target}
+\end{cases}
+$$
+
 * **Around Target**: Uses a continuous **Gaussian Bell Curve** centered on the shopper target price:
-  $$U_{\text{around}}(\text{price}, \text{target}) = 12.0 \times \exp\left( -0.5 \left(\frac{\text{price} - \text{target}}{\sigma}\right)^2 \right), \quad \sigma = \max(5.0, \, 0.25 \cdot \text{target})$$
+
+$$
+U_{\text{around}}(\text{price}, \text{target}) = 12.0 \times \exp\left( -0.5 \left(\frac{\text{price} - \text{target}}{\sigma}\right)^2 \right), \quad \sigma = \max(5.0, \, 0.25 \cdot \text{target})
+$$
 
 ---
 
