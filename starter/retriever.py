@@ -1,65 +1,25 @@
 from __future__ import annotations
 
+import functools
 import json
 import math
 import re
 import sqlite3
-import zlib
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from starter.semantic import LocalSemanticIndex
 from starter.tracker import active_constraints
-from starter.vocabulary import canonical_tokens, expanded_search_terms
 
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
-CONCEPT_MASK_BITS = 2048
-DISPLAY_COLORS = {
-    "beige", "black", "blue", "brown", "gold", "gray", "green", "navy",
-    "orange", "pink", "purple", "red", "silver", "white", "yellow",
-}
+HYPHEN_PREFIX_RE = re.compile(r"\b([a-z0-9]{1,4})-([a-z0-9]+)\b", re.IGNORECASE)
 STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
     "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "some",
     "that", "the", "this", "to", "want", "with", "would", "you", "looking",
     "what", "matters", "key", "requirement", "still", "exploring", "have", "has",
-}
-
-# Centralized calibration values. Exact field evidence intentionally outweighs
-# dense similarity; the latter is chiefly a recall signal for Browsing mode.
-ATTRIBUTE_COVERAGE_WEIGHTS = {
-    "brand": 20.0,
-    "color": 14.0,
-    "feature": 12.0,
-    "material": 18.0,
-    "size": 14.0,
-    "style": 14.0,
-    "use_case": 13.0,
-}
-ATTRIBUTE_PHRASE_WEIGHTS = {
-    "brand": 10.0,
-    "color": 7.0,
-    "feature": 9.0,
-    "material": 9.0,
-    "size": 8.0,
-    "style": 8.0,
-    "use_case": 8.0,
-}
-SEMANTIC_ROUTE_WEIGHTS = {"browsing": 0.9, "buying": 0.8}
-SEMANTIC_RERANK_WEIGHTS = {"browsing": 6.0, "buying": 4.0}
-OVERRIDE_MULTIPLIER = 1.5
-REDUNDANT_EVIDENCE_FLOOR = 0.75
-GENERIC_EVIDENCE = {
-    "all", "black", "blue", "brown", "button", "closure", "color", "cotton",
-    "gray", "green", "hand", "heather", "imported", "leather", "linen", "made",
-    "machine", "material", "nylon", "on", "polyester", "pull", "rayon", "red",
-    "silk", "solid", "spandex", "tie", "usa", "wash", "white", "wool", "zipper",
-}
-HYBRID_CATEGORY_CONCEPTS = {
-    "backpack", "loafer", "parka", "robe", "shacket", "slipon", "undershirt", "vest",
 }
 
 
@@ -73,14 +33,23 @@ def _flatten(value: object) -> str:
     return str(value)
 
 
+def _normalize_compounds(text: str) -> str:
+    """Normalizes hyphenated compounds (e.g. 't-shirt' -> 'tshirt t-shirt shirt', 'v-neck' -> 'vneck v-neck neck')."""
+    def repl(m: re.Match) -> str:
+        p1, p2 = m.group(1), m.group(2)
+        return f"{p1}{p2} {p1} {p2}"
+    return HYPHEN_PREFIX_RE.sub(repl, text)
+
+
 def _normal_text(value: object) -> str:
-    return " ".join(TOKEN_RE.findall(_flatten(value).casefold()))
+    return " ".join(TOKEN_RE.findall(_normalize_compounds(_flatten(value).casefold())))
 
 
 def _terms(value: object, limit: int = 48) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
-    for token in TOKEN_RE.findall(_flatten(value).casefold()):
+    cleaned = _normalize_compounds(_flatten(value).casefold())
+    for token in TOKEN_RE.findall(cleaned):
         if len(token) <= 1 or token in STOPWORDS or token in seen:
             continue
         seen.add(token)
@@ -103,47 +72,159 @@ def _numeric_price(value: object) -> float | None:
     return price if math.isfinite(price) and price >= 0 else None
 
 
-def _concept_mask(value: object) -> int:
-    """Compact two-hash signature used for fast synonym-aware coverage."""
+try:
+    import nltk
+    from nltk.corpus import wordnet as wn
+    from nltk.stem import PorterStemmer, WordNetLemmatizer
 
-    result = 0
-    for concept in set(canonical_tokens(value)):
-        if len(concept) <= 1 or concept in STOPWORDS:
-            continue
-        encoded = concept.encode("utf-8")
-        first = zlib.crc32(encoded) % CONCEPT_MASK_BITS
-        second = zlib.crc32(encoded, 0x9E3779B9) % CONCEPT_MASK_BITS
-        result |= (1 << first) | (1 << second)
+    _local_nltk_dir = Path(__file__).resolve().parent.parent / ".venv" / "nltk_data"
+    if _local_nltk_dir.exists():
+        nltk.data.path.append(str(_local_nltk_dir))
+
+    _STEMMER: PorterStemmer | None = PorterStemmer()
+    _LEMMATIZER: WordNetLemmatizer | None = WordNetLemmatizer()
+    _WN = wn
+except ImportError:
+    _STEMMER = None
+    _LEMMATIZER = None
+    _WN = None
+
+
+@functools.lru_cache(maxsize=16384)
+def _stem_word(word: str) -> str:
+    """Uses NLTK WordNetLemmatizer and PorterStemmer with an algorithmic fallback."""
+    w = word.casefold().strip()
+    if len(w) <= 2:
+        return w
+    if _LEMMATIZER is not None:
+        try:
+            w_noun = _LEMMATIZER.lemmatize(w, pos="n")
+            if w_noun != w:
+                return w_noun
+            w_verb = _LEMMATIZER.lemmatize(w, pos="v")
+            if w_verb != w:
+                return w_verb
+        except Exception:
+            pass
+    if _STEMMER is not None:
+        try:
+            return _STEMMER.stem(w)
+        except Exception:
+            pass
+
+    # Built-in algorithmic fallback when NLTK is not present
+    if len(w) > 4 and w.endswith("ies"):
+        return w[:-3] + "y"
+    if len(w) > 4 and (w.endswith("ses") or w.endswith("xes") or w.endswith("zes") or w.endswith("ches") or w.endswith("shes")):
+        return w[:-2]
+    if len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        return w[:-1]
+    if len(w) > 5 and w.endswith("ing") and not w.endswith("thing"):
+        return w[:-3]
+    if len(w) > 4 and w.endswith("ed"):
+        return w[:-2]
+    return w
+
+
+class WordNetSynonymProvider:
+    """Open-vocabulary synonym resolution using NLTK Princeton WordNet.
+    
+    Traverses WordNet's taxonomic synsets for noun artifact, substance, and attribute
+    concepts to provide dynamic, domain-general synonym expansion without requiring
+    hardcoded lexical lookup tables.
+    """
+
+    def __init__(self, wn_corpus: Any = _WN, custom_overlays: dict[str, tuple[str, ...]] | None = None) -> None:
+        self._wn = wn_corpus
+        self._overlays = custom_overlays or {}
+
+    @functools.lru_cache(maxsize=8192)
+    def synonyms(self, word: str, limit: int = 4) -> tuple[str, ...]:
+        syns: list[str] = []
+        seen: set[str] = {word}
+
+        # 1. Dynamic open-vocabulary WordNet synsets
+        if self._wn is not None:
+            try:
+                for syn in self._wn.synsets(word, pos="n"):
+                    lexname = syn.lexname()
+                    if lexname not in {"noun.artifact", "noun.substance", "noun.attribute"}:
+                        continue
+                    for lemma in syn.lemmas():
+                        clean = lemma.name().replace("_", "-").casefold()
+                        for part in clean.split("-"):
+                            if part not in seen and len(part) > 2 and part not in STOPWORDS:
+                                seen.add(part)
+                                syns.append(part)
+                                if len(syns) >= limit:
+                                    return tuple(syns)
+            except Exception:
+                pass
+
+        # 2. Optional domain overlays (if configured)
+        for overlay in self._overlays.get(word, ()):
+            if overlay not in seen and overlay not in STOPWORDS:
+                seen.add(overlay)
+                syns.append(overlay)
+                if len(syns) >= limit:
+                    break
+
+        return tuple(syns)
+
+
+_DEFAULT_SYNONYM_PROVIDER = WordNetSynonymProvider()
+
+
+def _expand_terms(
+    terms: Iterable[str],
+    limit: int = 36,
+    synonym_provider: WordNetSynonymProvider | None = None,
+) -> list[str]:
+    """Expands query terms with root-word stem matching and dynamic WordNet synsets."""
+    provider = synonym_provider or _DEFAULT_SYNONYM_PROVIDER
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw_term in terms:
+        if raw_term not in seen and raw_term not in STOPWORDS:
+            seen.add(raw_term)
+            result.append(raw_term)
+
+        stemmed = _stem_word(raw_term)
+        if stemmed not in seen and stemmed not in STOPWORDS:
+            seen.add(stemmed)
+            result.append(stemmed)
+
+        for syn in provider.synonyms(raw_term):
+            if syn not in seen and syn not in STOPWORDS:
+                seen.add(syn)
+                result.append(syn)
+                if len(result) >= limit:
+                    return result
     return result
 
 
-def _concept_present(concept: str, mask: int) -> bool:
-    encoded = concept.encode("utf-8")
-    first = zlib.crc32(encoded) % CONCEPT_MASK_BITS
-    second = zlib.crc32(encoded, 0x9E3779B9) % CONCEPT_MASK_BITS
-    return bool(mask & (1 << first) and mask & (1 << second))
-
-
-def _evidence_concepts(value: object) -> set[str]:
-    return {
-        token
-        for token in canonical_tokens(value)
-        if len(token) > 1 and not token.isdigit() and token not in STOPWORDS
-    }
-
-
-def _explicit_color_text(details: object) -> str:
-    if not isinstance(details, dict):
-        return ""
-    return " ".join(
-        str(value)
-        for key, value in details.items()
-        if "color" in str(key).casefold() and value not in (None, "")
-    )
-
-
-def _display_colors(value: object) -> tuple[str, ...]:
-    return tuple(token for token in canonical_tokens(value) if token in DISPLAY_COLORS)
+@dataclass(frozen=True)
+class RetrieverConfig:
+    """Hyperparameters governing candidate generation and reranking utility curves.
+    
+    Attributes:
+        base_retrieval_multiplier: Scaling factor for candidate RRF scores into reranker base.
+        rrf_k: Reciprocal Rank Fusion rank dampening constant (default: 12.0).
+        category_match_scale: Maximum points awarded for full category field coverage.
+        attribute_match_scale: Maximum base scale for field-weighted attribute coverage.
+        phrase_bonus_scale: Multiplier for exact consecutive multi-word phrase matches.
+        hard_budget_tolerance: Fractional overage allowed before steep budget penalties (0.10 = 10%).
+        budget_penalty_slope: Linear slope applied to overage beyond the tolerance margin.
+        negation_penalty: Fixed score penalty applied to items containing user-rejected terms.
+    """
+    base_retrieval_multiplier: float = 40.0
+    rrf_k: float = 12.0
+    category_match_scale: float = 12.0
+    attribute_match_scale: float = 16.0
+    phrase_bonus_scale: float = 3.5
+    hard_budget_tolerance: float = 0.10
+    budget_penalty_slope: float = 1.5
+    negation_penalty: float = 80.0
 
 
 @dataclass(frozen=True)
@@ -156,41 +237,63 @@ class ProductDocument:
     store: str
     description: str
     combined: str
-    category_concept_mask: int
-    combined_concept_mask: int
-    explicit_color_mask: int
-    title_colors: tuple[str, ...]
     price: float | None
     average_rating: float
     rating_number: int
 
 
-@dataclass(frozen=True)
-class RankingContext:
-    records: tuple[tuple[str, dict[str, Any]], ...]
-    evidence_weights: tuple[float, ...]
-    hybrid_category: bool
-
-
 class ProductRetriever:
-    """Offline FTS candidate generation followed by deterministic reranking."""
+    """Offline FTS candidate generation followed by deterministic reranking.
+    
+    Calculates dynamic BM25F field signal densities and vocabulary document frequencies (IDF)
+    at catalog load time to replace hardcoded field and term importance weights with mathematically
+    grounded information-theoretic values:
+    
+    1. Field Saliency (BM25F):
+       W_field = 3.0 * (1 / sqrt(avg_len(field))) / sum_f (1 / sqrt(avg_len(f)))
+       
+    2. Term Specificity (IDF):
+       IDF(t) = ln(1.0 + N / (DF(t) + 1))
+    """
 
-    def __init__(self, catalog_path: str | Path) -> None:
+    def __init__(
+        self,
+        catalog_path: str | Path,
+        config: RetrieverConfig | None = None,
+        synonym_provider: WordNetSynonymProvider | None = None,
+    ) -> None:
         self.catalog_path = Path(catalog_path)
+        self.config = config or RetrieverConfig()
+        self.synonym_provider = synonym_provider or _DEFAULT_SYNONYM_PROVIDER
         self.connection = sqlite3.connect(":memory:")
         self.documents: dict[str, ProductDocument] = {}
-        self.semantic_index = LocalSemanticIndex()
         self._popular: list[str] = []
+        self.doc_freq: dict[str, int] = defaultdict(int)
+        self.field_weights: dict[str, float] = {"title": 1.5, "features": 0.8, "description": 0.7}
+        self.candidate_limit_primary: int = 260
+        self.candidate_limit_broad: int = 420
+        self.candidate_limit_atomic: int = 150
+        self.conjunctive_weight: float = 3.0
+        self.disjunctive_weight: float = 1.0
+        self.atomic_weight: float = 1.0
         self._build_index()
+
+    def _expand(self, terms: Iterable[str], limit: int = 36) -> list[str]:
+        return _expand_terms(terms, limit=limit, synonym_provider=self.synonym_provider)
 
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
         cursor.execute(
             "CREATE VIRTUAL TABLE product_fts USING fts5("
             "parent_asin UNINDEXED, title, categories, features, details, store, description, "
-            "tokenize='unicode61 remove_diacritics 2')"
+            "tokenize='porter unicode61 remove_diacritics 2')"
         )
         batch: list[tuple[str, str, str, str, str, str, str]] = []
+        doc_count = 0
+        total_title_tokens = 0
+        total_feat_tokens = 0
+        total_desc_tokens = 0
+
         with self.catalog_path.open(encoding="utf-8") as handle:
             for line in handle:
                 if not line.strip():
@@ -204,9 +307,23 @@ class ProductRetriever:
                 store = _flatten(product.get("store"))
                 description = _flatten(product.get("description"))
                 combined = _normal_text(" ".join((title, categories, features, details, store, description)))
-                semantic_source = " ".join((title, features, details, categories, store, description))
                 rating = product.get("average_rating")
                 rating_number = product.get("rating_number")
+
+                doc_count += 1
+                t_terms = TOKEN_RE.findall(title.casefold())
+                f_terms = TOKEN_RE.findall(features.casefold())
+                d_terms = TOKEN_RE.findall(description.casefold())
+                total_title_tokens += len(t_terms)
+                total_feat_tokens += len(f_terms)
+                total_desc_tokens += len(d_terms)
+
+                # Track document frequency for vocabulary terms
+                seen_in_doc = set(t_terms) | set(f_terms)
+                for term in seen_in_doc:
+                    if term not in STOPWORDS and len(term) > 1:
+                        self.doc_freq[term] += 1
+
                 document = ProductDocument(
                     parent_asin=parent_asin,
                     title=_normal_text(title),
@@ -216,16 +333,11 @@ class ProductRetriever:
                     store=_normal_text(store),
                     description=_normal_text(description),
                     combined=combined,
-                    category_concept_mask=_concept_mask(f"{categories} {title}"),
-                    combined_concept_mask=_concept_mask(semantic_source),
-                    explicit_color_mask=_concept_mask(_explicit_color_text(product.get("details"))),
-                    title_colors=_display_colors(title),
                     price=_numeric_price(product.get("price")),
                     average_rating=float(rating) if isinstance(rating, (int, float)) else 0.0,
                     rating_number=int(rating_number) if isinstance(rating_number, (int, float)) else 0,
                 )
                 self.documents[parent_asin] = document
-                self.semantic_index.add(parent_asin, semantic_source)
                 batch.append((parent_asin, title, categories, features, details, store, description))
                 if len(batch) >= 1000:
                     cursor.executemany("INSERT INTO product_fts VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
@@ -233,6 +345,35 @@ class ProductRetriever:
         if batch:
             cursor.executemany("INSERT INTO product_fts VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
+
+        # Compute dynamic field weights via BM25F field-length normalization:
+        # W_field = 3.0 * (1 / sqrt(avg_len(field))) / sum_f (1 / sqrt(avg_len(f)))
+        if doc_count > 0:
+            avg_title = max(6.0, total_title_tokens / doc_count)
+            avg_feat = max(18.0, total_feat_tokens / doc_count)
+            avg_desc = max(24.0, total_desc_tokens / doc_count)
+
+            raw_t = 1.0 / math.sqrt(avg_title)
+            raw_f = 1.0 / math.sqrt(avg_feat)
+            raw_d = 1.0 / math.sqrt(avg_desc)
+            total_raw = raw_t + raw_f + raw_d
+
+            self.field_weights = {
+                "title": (raw_t / total_raw) * 3.0,
+                "features": (raw_f / total_raw) * 3.0,
+                "description": (raw_d / total_raw) * 3.0,
+            }
+
+            # Derive self-calibrating candidate pool limits sub-linearly: O(sqrt(N))
+            self.candidate_limit_primary = max(30, int(1.5 * math.sqrt(doc_count)))
+            self.candidate_limit_broad = max(50, int(2.0 * math.sqrt(doc_count)))
+            self.candidate_limit_atomic = max(20, int(0.75 * math.sqrt(doc_count)))
+
+            # Derive dynamic operator weights from document information density
+            self.conjunctive_weight = max(2.5, min(3.5, 0.75 * math.log(max(10.0, avg_title + avg_feat))))
+            self.disjunctive_weight = 1.0
+            self.atomic_weight = 1.0
+
         self._popular = sorted(
             self.documents,
             key=lambda asin: (
@@ -242,6 +383,29 @@ class ProductRetriever:
             ),
             reverse=True,
         )
+
+    def _idf(self, term: str) -> float:
+        """Calculates smoothed Inverse Document Frequency for term specificity:
+        
+        IDF(t) = ln(1.0 + N / (DF(t) + 1))
+        """
+        doc_count = max(1, len(self.documents))
+        df = self.doc_freq.get(term, 1)
+        return math.log(1.0 + doc_count / (df + 1))
+
+    def _constraint_salience(self, record: dict[str, Any], terms: list[str]) -> float:
+        """Dynamically computes constraint salience from term IDF, turn confidence, and override source:
+        
+        Salience = Override_Multiplier * Confidence * Specificity(IDF)
+        """
+        if not terms:
+            return 1.0
+        idfs = [self._idf(t) for t in terms]
+        avg_idf = sum(idfs) / len(idfs)
+        specificity = max(0.7, min(1.8, avg_idf / 2.5))
+        confidence = float(record.get("confidence", 1.0))
+        override_mult = 2.0 if record.get("source") == "override" else 1.0
+        return override_mult * confidence * specificity
 
     @staticmethod
     def _expression(terms: Iterable[str], operator: str = "OR") -> str:
@@ -271,208 +435,186 @@ class ProductRetriever:
                     records.append((attribute, record))
         return records
 
-    def _candidate_scores(self, state: dict[str, Any]) -> tuple[dict[str, float], dict[str, float]]:
+    def _candidate_scores(self, state: dict[str, Any]) -> dict[str, float]:
+        """Generate candidate pool using state-driven dynamic routing and Information-Theoretic Salience."""
+        # Step 1: Extract active category and clue terms from dialogue state
         constraints = active_constraints(state)
         category_terms = _terms(constraints.get("category", []), 24)
+        expanded_cat = self._expand(category_terms, 32)
         records = [
-            (attribute, record)
-            for attribute, record in self._active_records(state)
-            if attribute not in {"category", "budget"}
+            (attr, rec) for attr, rec in self._active_records(state)
+            if attr not in {"category", "budget"}
         ]
         records.sort(key=lambda item: (int(item[1].get("turn", 0)), float(item[1].get("confidence", 0.0))))
-        clue_terms = _terms([record["value"] for _, record in records], 48)
-        latest_terms = _terms([record["value"] for _, record in records[-2:]], 32)
-        expanded_terms = expanded_search_terms(
-            [*constraints.get("category", []), *[record["value"] for _, record in records]],
-            stopwords=STOPWORDS,
-            limit=72,
-        )
+
+        # Step 2: Dynamically calculate information-theoretic salience S_i for each constraint
+        rec_saliences: list[tuple[dict[str, Any], list[str], float]] = []
+        for _, rec in records:
+            v_terms = _terms(rec["value"], 24)
+            s = self._constraint_salience(rec, v_terms) if v_terms else 1.0
+            rec_saliences.append((rec, v_terms, s))
 
         routes: list[tuple[list[str], str, int, float]] = []
-        if expanded_terms:
-            routes.append((expanded_terms, "OR", 420, 0.9))
-        if category_terms or clue_terms:
-            routes.append((category_terms + clue_terms, "OR", 350, 1.0))
-        if category_terms and clue_terms:
-            # Simulator clues are copied from the target metadata, so the strict
-            # category-plus-clue route is high precision even for generic facts.
-            routes.append((category_terms + clue_terms[:32], "AND", 220, 2.2))
-        if clue_terms:
-            routes.append((clue_terms[:24], "AND", 180, 1.8))
-        if latest_terms:
-            routes.append((latest_terms, "AND", 180, 1.6))
-            routes.append((latest_terms, "OR", 220, 1.1))
-        if category_terms:
-            routes.append((category_terms, "OR", 220, 0.55))
-        for _, record in records[-4:]:
-            individual = _terms(record["value"], 20)
-            if individual:
-                routes.append((individual, "AND", 100, 1.25))
+        clue_terms = _terms([rec["value"] for _, rec in records], 48)
+        latest_terms = _terms([rec["value"] for _, rec in records[-2:]], 32)
+        override_recs = [r for r, _, _ in rec_saliences if r.get("source") == "override"]
+        override_terms = _terms([r["value"] for r in override_recs], 32)
 
+        primary_lim = self.candidate_limit_primary
+        broad_lim = self.candidate_limit_broad
+        atomic_lim = self.candidate_limit_atomic
+        conj_w = self.conjunctive_weight
+        disj_w = self.disjunctive_weight
+        atomic_w = self.atomic_weight
+
+        # Step 3: Dynamic route construction scaled by Information-Theoretic Salience
+        if override_terms:
+            mean_s = sum(s for r, _, s in rec_saliences if r.get("source") == "override") / max(1, len(override_recs))
+            if category_terms:
+                routes.append((category_terms + override_terms, "AND", primary_lim, conj_w * 1.15 * mean_s))
+            routes.append((override_terms, "AND", int(primary_lim * 0.8), conj_w * mean_s))
+            routes.append((override_terms, "OR", int(broad_lim * 0.75), disj_w * 1.5 * mean_s))
+            if category_terms:
+                routes.append((category_terms, "OR", primary_lim, disj_w * 0.8))
+        elif len(records) >= 1:
+            mean_s = sum(s for _, _, s in rec_saliences) / len(rec_saliences)
+            if category_terms and clue_terms:
+                routes.append((category_terms + clue_terms[:28], "AND", primary_lim, conj_w * 1.1 * mean_s))
+            if latest_terms:
+                routes.append((latest_terms, "AND", int(primary_lim * 0.8), conj_w * 0.8 * mean_s))
+                routes.append((latest_terms, "OR", primary_lim, disj_w * 1.2 * mean_s))
+            if clue_terms:
+                routes.append((clue_terms[:20], "AND", int(primary_lim * 0.8), conj_w * 0.7 * mean_s))
+            if expanded_cat or clue_terms:
+                routes.append((expanded_cat + clue_terms, "OR", broad_lim, disj_w * 0.7))
+            if expanded_cat:
+                routes.append((expanded_cat, "OR", primary_lim, disj_w * 0.5))
+        else:
+            if expanded_cat:
+                routes.append((expanded_cat, "OR", broad_lim, conj_w * 0.8))
+                routes.append((category_terms, "OR", primary_lim, conj_w * 0.6))
+
+        # Step 4: Atomic routes for individual constraints weighted by individual salience
+        for rec, v_terms, s in rec_saliences[-3:]:
+            if v_terms:
+                routes.append((v_terms, "AND", atomic_lim, atomic_w * s))
+
+        # Step 5: Execute FTS queries and combine candidate scores using Reciprocal Rank Fusion (RRF)
         scores: defaultdict[str, float] = defaultdict(float)
-        for terms, operator, limit, weight in routes:
-            for rank, parent_asin in enumerate(self._search(terms, limit, operator), start=1):
-                scores[parent_asin] += weight / (12.0 + rank)
-        semantic_query = " ".join(
-            str(value)
-            for attribute, values in constraints.items()
-            if attribute != "budget"
-            for value in values
-        )
-        scenario = str(state.get("scenario_detected"))
-        semantic_scores = self.semantic_index.search(semantic_query, 260) if scenario in SEMANTIC_ROUTE_WEIGHTS else {}
-        semantic_route_weight = SEMANTIC_ROUTE_WEIGHTS.get(scenario, 0.0)
-        for rank, parent_asin in enumerate(semantic_scores, start=1):
-            scores[parent_asin] += semantic_route_weight / (12.0 + rank)
-        return dict(scores), semantic_scores
+        for terms, op, limit, w in routes:
+            for rank, asin in enumerate(self._search(terms, limit, op), start=1):
+                scores[asin] += w / (self.config.rrf_k + rank)
+        return dict(scores)
 
     @staticmethod
-    def _coverage(terms: Iterable[str], text: str) -> float:
-        terms = tuple(terms)
+    def _coverage(terms: list[str], text: str) -> float:
         if not terms:
             return 0.0
         text_terms = set(text.split())
-        return sum(term in text_terms for term in terms) / len(terms)
+        stemmed_text = {_stem_word(t) for t in text_terms}
+        matches = sum(1 for term in terms if term in text_terms or _stem_word(term) in stemmed_text)
+        return matches / len(terms)
 
-    def _weighted_coverage(self, terms: list[str], concept_mask: int) -> float:
-        concepts = list(dict.fromkeys(
-            token for token in canonical_tokens(terms) if len(token) > 1 and token not in STOPWORDS
-        ))
-        if not concepts:
-            return 0.0
-        weights = [
-            math.log1p((self.semantic_index.document_count + 1) /
-                       (self.semantic_index.document_frequency(term) + 1))
-            for term in concepts
-        ]
-        denominator = sum(weights)
-        if not denominator:
-            return 0.0
-        return sum(
-            weight for term, weight in zip(concepts, weights) if _concept_present(term, concept_mask)
-        ) / denominator
+    def _rerank_score(self, document: ProductDocument, state: dict[str, Any], retrieval_score: float) -> float:
+        # Step 1: Base score from multi-route candidate retrieval stage
+        score = retrieval_score * self.config.base_retrieval_multiplier
 
-    @staticmethod
-    def _attribute_field(document: ProductDocument, attribute: str) -> str:
-        if attribute == "brand":
-            return f"{document.store} {document.title}"
-        if attribute == "color":
-            return f"{document.details} {document.title} {document.features}"
-        if attribute == "material":
-            return f"{document.details} {document.features} {document.title} {document.description}"
-        if attribute in {"size", "style"}:
-            return f"{document.details} {document.features} {document.title}"
-        return document.combined
-
-    def _ranking_context(self, state: dict[str, Any]) -> RankingContext:
-        records = tuple(self._active_records(state))
-        seen: defaultdict[str, set[str]] = defaultdict(set)
-        weights: list[float] = []
-        for attribute, record in records:
-            concepts = _evidence_concepts(record.get("value"))
-            previous = seen[attribute]
-            novelty = len(concepts - previous) / len(concepts) if concepts else 1.0
-            weight = 1.0 if not previous else REDUNDANT_EVIDENCE_FLOOR + (
-                1.0 - REDUNDANT_EVIDENCE_FLOOR
-            ) * novelty
-            previous.update(concepts)
-            weights.append(weight)
-        return RankingContext(
-            records=records,
-            evidence_weights=tuple(weights),
-            hybrid_category=any(
-                attribute == "category"
-                and bool(_evidence_concepts(record.get("value")) & HYBRID_CATEGORY_CONCEPTS)
-                for attribute, record in records
-            ),
-        )
-
-    def _color_confidence(self, document: ProductDocument, value_terms: list[str]) -> float:
-        requested = set(canonical_tokens(value_terms)) & DISPLAY_COLORS
-        if not requested:
-            return 1.0
-        if document.explicit_color_mask:
-            return 1.0 if any(
-                _concept_present(color, document.explicit_color_mask) for color in requested
-            ) else 0.0
-        title_matches = [color for color in document.title_colors if color in requested]
-        if title_matches:
-            # A leading color plus a different terminal color commonly denotes a
-            # named design or band (for example, "Red Hot ... T-Shirt Black").
-            if len(set(document.title_colors)) > 1 and document.title_colors[-1] not in requested:
-                return 0.75
-            return 0.95
-        if any(_concept_present(color, document.combined_concept_mask) for color in requested):
-            # Feature-list colors often describe fabric blends or available
-            # variants, so they are supporting rather than definitive evidence.
-            return 0.9
-        return 0.0
-
-    def _rerank_score(
-        self,
-        document: ProductDocument,
-        state: dict[str, Any],
-        retrieval_score: float,
-        semantic_score: float = 0.0,
-        context: RankingContext | None = None,
-    ) -> float:
-        context = context or self._ranking_context(state)
-        score = retrieval_score * 100.0
-        semantic_weight = SEMANTIC_RERANK_WEIGHTS.get(str(state.get("scenario_detected")), 0.0)
-        score += semantic_weight * max(0.0, semantic_score)
-        for (attribute, record), evidence_weight in zip(context.records, context.evidence_weights):
+        # Step 2: Attribute and category matching with hierarchical field weighting
+        for attribute, record in self._active_records(state):
             value_terms = _terms(record["value"], 40)
-            if not value_terms:
+            if not value_terms or attribute == "budget":
                 continue
-            if attribute == "budget":
-                continue
+
+            salience = self._constraint_salience(record, value_terms)
+            normalized_phrase = " ".join(value_terms)
+
+            # 2a. Category matching against categories and title fields
             if attribute == "category":
-                field = f"{document.categories} {document.title}"
-                coverage = self._weighted_coverage(value_terms, document.category_concept_mask)
-                score += 11.0 * coverage
-                if context.hybrid_category:
-                    score += 6.0 * self._weighted_coverage(
-                        value_terms,
-                        _concept_mask(document.title),
+                cat_cov = self._coverage(value_terms, document.categories)
+                title_cov = self._coverage(value_terms, document.title)
+                combined_cat_cov = max(cat_cov * 1.0, title_cov * 0.9)
+                if combined_cat_cov < 1.0:
+                    expanded = self._expand(value_terms, 24)
+                    expanded_cat_cov = max(
+                        self._coverage(expanded, document.categories),
+                        self._coverage(expanded, document.title) * 0.9,
                     )
-                if " ".join(value_terms) in field:
+                    combined_cat_cov = max(combined_cat_cov, expanded_cat_cov * 0.85)
+
+                score += self.config.category_match_scale * combined_cat_cov
+                if normalized_phrase in document.categories:
+                    score += 4.0
+                elif normalized_phrase in document.title:
                     score += 3.0
                 continue
 
-            field = self._attribute_field(document, attribute)
-            coverage = self._weighted_coverage(value_terms, document.combined_concept_mask)
-            field_coverage = self._coverage(value_terms, field)
-            if attribute == "color":
-                evidence_weight *= self._color_confidence(document, value_terms)
-            source_weight = OVERRIDE_MULTIPLIER if record.get("source") == "override" else 1.0
-            source_weight *= evidence_weight
-            base_weight = ATTRIBUTE_COVERAGE_WEIGHTS.get(attribute, 12.0)
-            score += source_weight * base_weight * (0.75 * coverage + 0.25 * field_coverage)
-            normalized_phrase = " ".join(value_terms)
-            if normalized_phrase and normalized_phrase in field:
-                score += source_weight * ATTRIBUTE_PHRASE_WEIGHTS.get(attribute, 8.0)
-            informative = _evidence_concepts(record.get("value")) - GENERIC_EVIDENCE
-            if len(value_terms) >= 2 and informative and normalized_phrase in document.title:
-                score += source_weight * 4.0
-            if attribute in {"material", "color", "brand"} and coverage == 1.0:
-                score += source_weight * 5.0
+            # 2b. Attribute matching with dynamic BM25F field weighting (Title > Features > Description)
+            title_cov = self._coverage(value_terms, document.title)
+            feat_cov = self._coverage(value_terms, f"{document.features} {document.details}")
+            desc_cov = self._coverage(value_terms, document.description)
 
+            if max(title_cov, feat_cov, desc_cov) < 1.0:
+                expanded = self._expand(value_terms, 24)
+                title_cov = max(title_cov, self._coverage(expanded, document.title) * 0.9)
+                feat_cov = max(feat_cov, self._coverage(expanded, f"{document.features} {document.details}") * 0.85)
+                desc_cov = max(desc_cov, self._coverage(expanded, document.description) * 0.75)
+
+            # Normalized by the sum of dynamic field weights (3.0)
+            field_weighted_coverage = (
+                self.field_weights["title"] * title_cov +
+                self.field_weights["features"] * feat_cov +
+                self.field_weights["description"] * desc_cov
+            ) / 3.0
+            score += salience * self.config.attribute_match_scale * field_weighted_coverage
+
+            # 2c. Consecutive exact phrase bonus
+            if normalized_phrase:
+                if normalized_phrase in document.title:
+                    score += salience * self.config.phrase_bonus_scale * self.field_weights["title"]
+                elif normalized_phrase in document.features or normalized_phrase in document.details:
+                    score += salience * self.config.phrase_bonus_scale * self.field_weights["features"]
+                elif normalized_phrase in document.description:
+                    score += salience * self.config.phrase_bonus_scale * self.field_weights["description"]
+
+            # 2d. Information-theoretic exact coverage bonus (self-calibrating via IDF)
+            if max(title_cov, feat_cov) >= 1.0:
+                max_idf = max((self._idf(t) for t in value_terms), default=2.5)
+                specificity_bonus = min(4.0, max(1.5, max_idf * 0.8))
+                score += salience * specificity_bonus
+
+        # Step 3: Heavy penalty for user-rejected / negated terms (e.g. "no wool")
         for excluded in state.get("excluded_terms", []):
             if re.search(rf"\b{re.escape(str(excluded).casefold())}\b", document.combined):
-                score -= 80.0
+                score -= self.config.negation_penalty
 
+        # Step 4: Calibrated budget filtering and price proximity scoring
         for record in state["constraints"].get("budget", []):
             if record.get("status") != "active" or "numeric_value" not in record:
                 continue
             target = float(record["numeric_value"])
             if document.price is None:
+                score += 1.5
                 continue
-            if record.get("price_mode") == "maximum":
-                score += 9.0 if document.price <= target else -min(24.0, 6.0 + document.price - target)
-            else:
-                scale = max(5.0, target * 0.25)
-                score += 14.0 * max(0.0, 1.0 - abs(document.price - target) / scale)
 
+            if record.get("price_mode") == "maximum":
+                if document.price <= target:
+                    # Under budget bonus + savings incentive
+                    savings_ratio = max(0.0, (target - document.price) / max(1.0, target))
+                    score += 8.0 + 2.0 * savings_ratio
+                elif document.price <= target * (1.0 + self.config.hard_budget_tolerance):
+                    # Mild tolerance margin
+                    overage_ratio = (document.price - target) / (target * self.config.hard_budget_tolerance)
+                    score -= 5.0 * overage_ratio
+                else:
+                    # Steep penalty for major budget violations
+                    score -= 35.0 + min(40.0, (document.price - target) * self.config.budget_penalty_slope)
+            else:
+                # Gaussian proximity curve for 'around' mode
+                sigma = max(5.0, target * 0.25)
+                diff = document.price - target
+                score += 12.0 * math.exp(-0.5 * (diff / sigma) ** 2)
+
+        # Step 5: Personalization tags and review quality priors
         profile = state.get("user_profile") or {}
         for tag in profile.get("preference_tags", []) or []:
             tag_terms = _terms(tag, 4)
@@ -484,16 +626,22 @@ class ProductRetriever:
         return score
 
     def _category_fallback(self, state: dict[str, Any], needed: int, seen: set[str]) -> list[str]:
+        """Safety fallback to guarantee returning 10 catalog-valid recommendations."""
         categories = active_constraints(state).get("category", [])
         category_terms = _terms(categories, 24)
+        expanded_terms = self._expand(category_terms, 32)
         result: list[str] = []
-        if category_terms:
-            for parent_asin in self._search(category_terms, max(needed * 8, 80), "OR"):
+        
+        # Fallback Level 1: Broader category matches (with synonyms)
+        if expanded_terms:
+            for parent_asin in self._search(expanded_terms, max(needed * 8, 80), "OR"):
                 if parent_asin not in seen:
                     seen.add(parent_asin)
                     result.append(parent_asin)
                     if len(result) >= needed:
                         return result
+                        
+        # Fallback Level 2: Top popular/high-rated catalog items
         for parent_asin in self._popular:
             if parent_asin not in seen:
                 seen.add(parent_asin)
@@ -504,24 +652,17 @@ class ProductRetriever:
 
     def recommend(self, state: dict[str, Any], top_k: int = 10) -> list[dict[str, str]]:
         limit = max(1, min(int(top_k), 10))
-        retrieval_scores, semantic_scores = self._candidate_scores(state)
-        context = self._ranking_context(state)
+        # Multi-route candidate generation
+        retrieval_scores = self._candidate_scores(state)
+        # Reranking based on context
         ranked = sorted(
             retrieval_scores,
-            key=lambda asin: (
-                self._rerank_score(
-                    self.documents[asin],
-                    state,
-                    retrieval_scores[asin],
-                    semantic_scores.get(asin, 0.0),
-                    context,
-                ),
-                asin,
-            ),
+            key=lambda asin: (self._rerank_score(self.documents[asin], state, retrieval_scores[asin]), asin),
             reverse=True,
         )
         selected = ranked[:limit]
         seen = set(selected)
         if len(selected) < limit:
+            # Fallback if < 10 items
             selected.extend(self._category_fallback(state, limit - len(selected), seen))
         return [{"parent_asin": parent_asin} for parent_asin in selected]

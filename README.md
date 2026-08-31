@@ -32,9 +32,22 @@ mv catalog.jsonl data/catalog.jsonl
 
 Verify the downloaded file using the published `SHA256SUMS` file.
 
-## Run the Starter
+## Setup & Dependencies
 
-Python 3.10 or later is recommended. The starter uses only the Python standard library.
+Python 3.10 or later is recommended. To set up an isolated environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Dependencies & Attributions:
+- **NLTK (Natural Language Toolkit)**: `nltk.stem.PorterStemmer` for morphological root-word normalization.
+- **Python Standard Library**: `sqlite3` (with in-memory FTS5 Full-Text Search and Porter tokenizer), `math`, `re`, `json`, `collections`, `dataclasses`.
+- **Dataset**: Amazon Reviews 2023 (`Clothing_Shoes_and_Jewelry` 5-core catalog) provided by McAuley Lab, UCSD. See `DATA_ATTRIBUTION.md`.
+
+## Run the Starter
 
 ```bash
 python3 -m evaluator.local_evaluator

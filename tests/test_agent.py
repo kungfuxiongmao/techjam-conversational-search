@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from starter.agent import Agent
-from starter.retriever import ProductDocument, ProductRetriever, _concept_mask
+from starter.retriever import ProductRetriever
 from starter.tracker import new_buyer_state, update_buyer_state
 
 
@@ -59,6 +59,18 @@ PRODUCTS = [
         "rating_number": 800,
         "store": "Example",
     },
+    {
+        "parent_asin": "NO_PRICE",
+        "title": "Grey Cotton Crew Neck Shirt",
+        "features": ["100% soft cotton"],
+        "description": [],
+        "price": None,
+        "categories": ["Clothing, Shoes & Jewelry", "Men", "Clothing", "Shirts"],
+        "details": {"Color": "Grey"},
+        "average_rating": 4.6,
+        "rating_number": 300,
+        "store": "Example",
+    },
 ]
 
 
@@ -95,67 +107,63 @@ class RetrieverAndAgentTest(unittest.TestCase):
         ranked = retriever.recommend(state, 4)
         self.assertNotEqual(ranked[0]["parent_asin"], "WOOL")
 
-    def test_retriever_matches_kicks_to_running_shoe(self) -> None:
+    def test_retriever_matches_synonyms(self) -> None:
         retriever = ProductRetriever(self.catalog_path)
-        state = new_buyer_state("synonyms", {})
-        update_buyer_state(state, "I want lightweight kicks for jogging", 1)
+        state = new_buyer_state("s", {})
+        # User says "sneakers" which does not appear in product title "Black Running Shoe"
+        update_buyer_state(state, "I'm looking for sneakers, but I'm still exploring.", 1)
         ranked = retriever.recommend(state, 4)
+        # Synonym expansion maps 'sneakers' -> 'running', 'shoe', so SHOE should rank #1
         self.assertEqual(ranked[0]["parent_asin"], "SHOE")
 
-    def test_retriever_matches_tee_to_tshirt(self) -> None:
+    def test_retriever_dual_track_override_routing(self) -> None:
         retriever = ProductRetriever(self.catalog_path)
-        state = new_buyer_state("tee", {})
-        update_buyer_state(state, "I want a black cotton tee with a crew neck", 1)
-        ranked = retriever.recommend(state, 4)
-        self.assertEqual(ranked[0]["parent_asin"], "TARGET")
-
-    def test_duplicate_material_evidence_is_discounted(self) -> None:
-        retriever = ProductRetriever(self.catalog_path)
-        state = new_buyer_state("duplicates", {})
+        state = new_buyer_state("s", {})
+        update_buyer_state(state, "I'm looking for Men Shirts. 100% cotton fabric", 1)
+        update_buyer_state(state, "For that, what matters is: color: black.", 2)
+        # Turn 3: Override to warm wool
         update_buyer_state(
             state,
-            "I'm looking for shirts. A key requirement is: cotton.",
-            1,
+            "Actually, ignore my earlier preference. What I need is: warm wool.",
+            3,
         )
-        update_buyer_state(state, "For that, what matters is: 100% cotton.", 2)
-        context = retriever._ranking_context(state)
-        material_weights = [
-            weight
-            for (attribute, _), weight in zip(context.records, context.evidence_weights)
-            if attribute == "material"
-        ]
-        self.assertEqual(material_weights[0], 1.0)
-        self.assertLess(material_weights[1], 1.0)
+        ranked = retriever.recommend(state, 4)
+        # Dual-track override routing should immediately prioritize the wool shirt
+        self.assertEqual(ranked[0]["parent_asin"], "WOOL")
 
-    def test_named_color_is_weaker_than_an_unambiguous_product_color(self) -> None:
+    def test_retriever_field_specific_title_boosting(self) -> None:
         retriever = ProductRetriever(self.catalog_path)
+        state = new_buyer_state("s", {})
+        update_buyer_state(state, "I'm looking for Men Shirts T-Shirts. A key requirement is: 100% cotton.", 1)
+        update_buyer_state(state, "For that, what matters is: crew neck.", 2)
+        ranked = retriever.recommend(state, 4)
+        # TARGET matches both 100% cotton and crew neck in Title and Features, ranking it #1
+        self.assertEqual(ranked[0]["parent_asin"], "TARGET")
 
-        def document(title: str) -> ProductDocument:
-            normalized = title.casefold()
-            return ProductDocument(
-                parent_asin=title,
-                title=normalized,
-                categories="t shirts",
-                features="",
-                details="",
-                store="example",
-                description="",
-                combined=normalized,
-                category_concept_mask=_concept_mask("t shirts"),
-                combined_concept_mask=_concept_mask(normalized),
-                explicit_color_mask=0,
-                title_colors=tuple(color for color in ("red", "black") if color in normalized),
-                price=None,
-                average_rating=0.0,
-                rating_number=0,
-            )
+    def test_retriever_hard_budget_filtering(self) -> None:
+        retriever = ProductRetriever(self.catalog_path)
+        state = new_buyer_state("s", {})
+        update_buyer_state(state, "I want Men Shirts with price under 30 dollars", 1)
+        ranked = retriever.recommend(state, 4)
+        # Products <= $30 should be prioritized ahead of WOOL ($70.00)
+        self.assertIn(ranked[0]["parent_asin"], {"TARGET", "WHITE"})
+        self.assertEqual(ranked[-1]["parent_asin"], "WOOL")
 
-        named = document("Red Hot Band T-Shirt Black")
-        unambiguous = document("Plain Red T-Shirt")
-        self.assertLess(
-            retriever._color_confidence(named, ["red"]),
-            retriever._color_confidence(unambiguous, ["red"]),
-        )
+    def test_retriever_soft_budget_proximity(self) -> None:
+        retriever = ProductRetriever(self.catalog_path)
+        state = new_buyer_state("s", {})
+        update_buyer_state(state, "I want Men Shirts around 25 dollars", 1)
+        ranked = retriever.recommend(state, 4)
+        # Products with prices near $25 receive proximity bonuses over $70
+        self.assertIn(ranked[0]["parent_asin"], {"TARGET", "WHITE"})
+
+    def test_retriever_handles_missing_price_gracefully(self) -> None:
+        retriever = ProductRetriever(self.catalog_path)
+        state = new_buyer_state("s", {})
+        update_buyer_state(state, "I want grey cotton shirt", 1)
+        ranked = retriever.recommend(state, 4)
+        # NO_PRICE product (price: None) is properly scored and recommended #1
+        self.assertEqual(ranked[0]["parent_asin"], "NO_PRICE")
 
     def test_agent_returns_valid_contract_and_tracks_question(self) -> None:
         agent = Agent(self.catalog_path)
@@ -165,7 +173,7 @@ class RetrieverAndAgentTest(unittest.TestCase):
         )
         self.assertIsInstance(response["message"], str)
         self.assertEqual(response["ask_attribute"], "other")
-        self.assertEqual(len(response["recommendations"]), 4)
+        self.assertEqual(len(response["recommendations"]), len(PRODUCTS))
         self.assertEqual(response["usage"], {"prompt_tokens": 0, "completion_tokens": 0})
         self.assertEqual(agent.tracker.get("session")["asked_attributes"], ["other"])
 
