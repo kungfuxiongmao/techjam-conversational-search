@@ -50,12 +50,12 @@ flowchart TD
 ### Pillar I: Dynamic BM25F Field Signal Density Normalization
 Rather than hardcoding static importance weights per document field, the retriever self-calibrates at catalog index time based on the **information density per token** across fields. Concise fields (e.g., Titles) carry higher semantic specificity per word than verbose descriptions:
 
-$$W_{\text{field}} = 3.0 \times \frac{\frac{1}{\sqrt{\text{avg\_len}(\text{field})}}}{\sum_{f \in \mathcal{F}} \frac{1}{\sqrt{\text{avg\_len}(f)}}}$$
+$$W_{\text{field}} = 3.0 \times \frac{\frac{1}{\sqrt{\text{avgLen}(\text{field})}}}{\sum_{f \in \mathcal{F}} \frac{1}{\sqrt{\text{avgLen}(f)}}}$$
 
 Where:
-* $\text{avg\_len}(\text{title}) \approx 11.7 \implies W_{\text{title}} \approx 1.54$ (Highest signal density)
-* $\text{avg\_len}(\text{description}) \approx 45.0 \implies W_{\text{desc}} \approx 0.79$
-* $\text{avg\_len}(\text{features}) \approx 62.1 \implies W_{\text{features}} \approx 0.67$
+* $\text{avgLen}(\text{title}) \approx 11.7 \implies W_{\text{title}} \approx 1.54$ (Highest signal density)
+* $\text{avgLen}(\text{description}) \approx 45.0 \implies W_{\text{desc}} \approx 0.79$
+* $\text{avgLen}(\text{features}) \approx 62.1 \implies W_{\text{features}} \approx 0.67$
 
 $$\sum_{f \in \mathcal{F}} W_f = 3.0 \quad (\text{Preserving canonical scale invariance})$$
 
@@ -68,11 +68,11 @@ $$\text{IDF}(t) = \ln\left(1.0 + \frac{N}{\text{DF}(t) + 1}\right)$$
 
 Each active user constraint $R_i$ is assigned a dynamic **Information-Theoretic Salience**:
 
-$$\text{Salience}(R_i) = \text{Override\_Multiplier} \times \text{Confidence}_i \times \text{Specificity}(\text{IDF}_i)$$
+$$\text{Salience}(R_i) = \text{overrideMultiplier} \times \text{Confidence}_i \times \text{Specificity}(\text{IDF}_i)$$
 
 Where:
 $$\text{Specificity}(\text{IDF}_i) = \max\left(0.7, \, \min\left(1.8, \, \frac{\overline{\text{IDF}(R_i)}}{2.5}\right)\right)$$
-$$\text{Override\_Multiplier} = \begin{cases} 2.0 & \text{if source} = \text{"override"} \\ 1.0 & \text{otherwise} \end{cases}$$
+$$\text{overrideMultiplier} = \begin{cases} 2.0 & \text{if source} = \text{"override"} \\ 1.0 & \text{otherwise} \end{cases}$$
 
 ---
 
@@ -90,11 +90,11 @@ For $N = 50,000$: $K_{\text{primary}} = 335$, $K_{\text{broad}} = 447$, $K_{\tex
 ### Pillar IV: Reciprocal Rank Fusion ($\text{RRF}$) with Dynamic Operator Weighting
 Candidates generated across multiple search routes are fused using Cormack Reciprocal Rank Fusion:
 
-$$\text{RRF\_Score}(d) = \sum_{r \in \text{Routes}} \frac{W_r}{k_{\text{rrf}} + \text{rank}_r(d)}$$
+$$\text{rrfScore}(d) = \sum_{r \in \text{Routes}} \frac{W_r}{k_{\text{rrf}} + \text{rank}_r(d)}$$
 
 Where:
 * $k_{\text{rrf}} = 12.0$ (Calibrated dampening constant balancing rank-1 precision with recall tail stability).
-* Conjunctive (`AND`) Route Weight: $W_{\text{conj}} = \max\left(2.5, \, \min\left(3.5, \, 0.75 \ln(\text{avg\_title} + \text{avg\_feat})\right)\right) \times \bar{S} \approx 3.19 \times \bar{S}$.
+* Conjunctive (`AND`) Route Weight: $W_{\text{conj}} = \max\left(2.5, \, \min\left(3.5, \, 0.75 \ln(\text{avgTitle} + \text{avgFeat})\right)\right) \times \bar{S} \approx 3.19 \times \bar{S}$.
 * Disjunctive (`OR`) Route Weight: $W_{\text{disj}} = 1.0 \times \bar{S}$.
 
 ---
