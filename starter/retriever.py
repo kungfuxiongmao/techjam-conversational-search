@@ -270,6 +270,12 @@ class ProductRetriever:
         self._popular: list[str] = []
         self.doc_freq: dict[str, int] = defaultdict(int)
         self.field_weights: dict[str, float] = {"title": 1.5, "features": 0.8, "description": 0.7}
+        self.candidate_limit_primary: int = 260
+        self.candidate_limit_broad: int = 420
+        self.candidate_limit_atomic: int = 150
+        self.conjunctive_weight: float = 3.0
+        self.disjunctive_weight: float = 1.0
+        self.atomic_weight: float = 1.0
         self._build_index()
 
     def _expand(self, terms: Iterable[str], limit: int = 36) -> list[str]:
@@ -358,6 +364,16 @@ class ProductRetriever:
                 "description": (raw_d / total_raw) * 3.0,
             }
 
+            # Derive self-calibrating candidate pool limits sub-linearly: O(sqrt(N))
+            self.candidate_limit_primary = max(30, int(1.5 * math.sqrt(doc_count)))
+            self.candidate_limit_broad = max(50, int(2.0 * math.sqrt(doc_count)))
+            self.candidate_limit_atomic = max(20, int(0.75 * math.sqrt(doc_count)))
+
+            # Derive dynamic operator weights from document information density
+            self.conjunctive_weight = max(2.5, min(3.5, 0.75 * math.log(max(10.0, avg_title + avg_feat))))
+            self.disjunctive_weight = 1.0
+            self.atomic_weight = 1.0
+
         self._popular = sorted(
             self.documents,
             key=lambda asin: (
@@ -420,73 +436,74 @@ class ProductRetriever:
         return records
 
     def _candidate_scores(self, state: dict[str, Any]) -> dict[str, float]:
-        """Generate candidate pool using dynamic Dual-Track Intent Routing (Pillar I)."""
+        """Generate candidate pool using state-driven dynamic routing and Information-Theoretic Salience."""
         # Step 1: Extract active category and clue terms from dialogue state
         constraints = active_constraints(state)
         category_terms = _terms(constraints.get("category", []), 24)
-        expanded_category_terms = self._expand(category_terms, 32)
+        expanded_cat = self._expand(category_terms, 32)
         records = [
-            (attribute, record)
-            for attribute, record in self._active_records(state)
-            if attribute not in {"category", "budget"}
+            (attr, rec) for attr, rec in self._active_records(state)
+            if attr not in {"category", "budget"}
         ]
-        # Sort records chronologically by turn and confidence
         records.sort(key=lambda item: (int(item[1].get("turn", 0)), float(item[1].get("confidence", 0.0))))
-        clue_terms = _terms([record["value"] for _, record in records], 48)
-        latest_terms = _terms([record["value"] for _, record in records[-2:]], 32)
 
-        scenario = state.get("scenario_detected", "unknown")
-        turn = state.get("turn_count", 1)
+        # Step 2: Dynamically calculate information-theoretic salience S_i for each constraint
+        rec_saliences: list[tuple[dict[str, Any], list[str], float]] = []
+        for _, rec in records:
+            v_terms = _terms(rec["value"], 24)
+            s = self._constraint_salience(rec, v_terms) if v_terms else 1.0
+            rec_saliences.append((rec, v_terms, s))
+
         routes: list[tuple[list[str], str, int, float]] = []
+        clue_terms = _terms([rec["value"] for _, rec in records], 48)
+        latest_terms = _terms([rec["value"] for _, rec in records[-2:]], 32)
+        override_recs = [r for r, _, _ in rec_saliences if r.get("source") == "override"]
+        override_terms = _terms([r["value"] for r in override_recs], 32)
 
-        # Step 2: Configure search routes based on the detected buyer scenario
-        # Track A: Intent override routing when preferences change
-        if scenario == "intent_override":
-            override_records = [r for _, r in records if r.get("source") == "override"]
-            override_terms = _terms([r["value"] for r in override_records], 32)
-            if override_terms:
-                if category_terms:
-                    routes.append((category_terms + override_terms, "AND", 180, 3.5))
-                routes.append((override_terms, "AND", 150, 3.0))
-                routes.append((override_terms, "OR", 220, 1.8))
+        primary_lim = self.candidate_limit_primary
+        broad_lim = self.candidate_limit_broad
+        atomic_lim = self.candidate_limit_atomic
+        conj_w = self.conjunctive_weight
+        disj_w = self.disjunctive_weight
+        atomic_w = self.atomic_weight
+
+        # Step 3: Dynamic route construction scaled by Information-Theoretic Salience
+        if override_terms:
+            mean_s = sum(s for r, _, s in rec_saliences if r.get("source") == "override") / max(1, len(override_recs))
             if category_terms:
-                routes.append((category_terms, "OR", 200, 0.8))
-
-        # Track B: High-precision routing for buying sessions or later turns
-        elif scenario == "buying" or turn >= 3 or len(records) >= 2:
+                routes.append((category_terms + override_terms, "AND", primary_lim, conj_w * 1.15 * mean_s))
+            routes.append((override_terms, "AND", int(primary_lim * 0.8), conj_w * mean_s))
+            routes.append((override_terms, "OR", int(broad_lim * 0.75), disj_w * 1.5 * mean_s))
+            if category_terms:
+                routes.append((category_terms, "OR", primary_lim, disj_w * 0.8))
+        elif len(records) >= 1:
+            mean_s = sum(s for _, _, s in rec_saliences) / len(rec_saliences)
             if category_terms and clue_terms:
-                routes.append((category_terms + clue_terms[:28], "AND", 180, 3.2))
+                routes.append((category_terms + clue_terms[:28], "AND", primary_lim, conj_w * 1.1 * mean_s))
             if latest_terms:
-                routes.append((latest_terms, "AND", 140, 2.4))
-                routes.append((latest_terms, "OR", 200, 1.2))
+                routes.append((latest_terms, "AND", int(primary_lim * 0.8), conj_w * 0.8 * mean_s))
+                routes.append((latest_terms, "OR", primary_lim, disj_w * 1.2 * mean_s))
             if clue_terms:
-                routes.append((clue_terms[:20], "AND", 140, 2.0))
-            if expanded_category_terms or clue_terms:
-                routes.append((expanded_category_terms + clue_terms, "OR", 300, 0.7))
-            if expanded_category_terms:
-                routes.append((expanded_category_terms, "OR", 200, 0.5))
-
-        # Track C: Exploratory browsing routing for broad early-turn discovery
+                routes.append((clue_terms[:20], "AND", int(primary_lim * 0.8), conj_w * 0.7 * mean_s))
+            if expanded_cat or clue_terms:
+                routes.append((expanded_cat + clue_terms, "OR", broad_lim, disj_w * 0.7))
+            if expanded_cat:
+                routes.append((expanded_cat, "OR", primary_lim, disj_w * 0.5))
         else:
-            if expanded_category_terms:
-                routes.append((expanded_category_terms, "OR", 380, 2.5))
-                routes.append((category_terms, "OR", 220, 1.8))
-            if clue_terms:
-                routes.append((clue_terms, "OR", 250, 1.5))
-                if category_terms:
-                    routes.append((category_terms + clue_terms[:12], "AND", 120, 1.4))
+            if expanded_cat:
+                routes.append((expanded_cat, "OR", broad_lim, conj_w * 0.8))
+                routes.append((category_terms, "OR", primary_lim, conj_w * 0.6))
 
-        # Track D: Exact attribute phrase routes for recent individual constraints
-        for _, record in records[-3:]:
-            individual = _terms(record["value"], 16)
-            if individual:
-                routes.append((individual, "AND", 100, 1.25))
+        # Step 4: Atomic routes for individual constraints weighted by individual salience
+        for rec, v_terms, s in rec_saliences[-3:]:
+            if v_terms:
+                routes.append((v_terms, "AND", atomic_lim, atomic_w * s))
 
-        # Step 3: Execute FTS queries and combine candidate scores using Reciprocal Rank Fusion (RRF)
+        # Step 5: Execute FTS queries and combine candidate scores using Reciprocal Rank Fusion (RRF)
         scores: defaultdict[str, float] = defaultdict(float)
-        for terms, operator, limit, weight in routes:
-            for rank, parent_asin in enumerate(self._search(terms, limit, operator), start=1):
-                scores[parent_asin] += weight / (self.config.rrf_k + rank)
+        for terms, op, limit, w in routes:
+            for rank, asin in enumerate(self._search(terms, limit, op), start=1):
+                scores[asin] += w / (self.config.rrf_k + rank)
         return dict(scores)
 
     @staticmethod
