@@ -4,6 +4,8 @@ import re
 from copy import deepcopy
 from typing import Any
 
+from starter.vocabulary import canonical_tokens, vocabulary_categories
+
 
 ATTRIBUTES = (
     "category",
@@ -112,6 +114,7 @@ CATEGORY_WORDS = (
     "bracelets",
     "costume",
     "costumes",
+    *vocabulary_categories(),
 )
 
 _LOOKING_FOR_RE = re.compile(
@@ -161,6 +164,9 @@ def classify_constraint(value: str) -> str:
     lowered = value.casefold()
     if "budget" in lowered or _price_parts(lowered):
         return "budget"
+    concepts = set(canonical_tokens(lowered))
+    if concepts & {"activewear", "formalshoe", "handbag", "hoodie", "pants", "sneaker", "tshirt"}:
+        return "category"
     if any(re.search(rf"\b{re.escape(term)}\b", lowered) for term in MATERIALS):
         return "material"
     if any(re.search(rf"\b{re.escape(term)}\b", lowered) for term in COLORS):

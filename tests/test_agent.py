@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from starter.agent import Agent
-from starter.retriever import ProductRetriever
+from starter.retriever import ProductDocument, ProductRetriever, _concept_mask
 from starter.tracker import new_buyer_state, update_buyer_state
 
 
@@ -94,6 +94,68 @@ class RetrieverAndAgentTest(unittest.TestCase):
         update_buyer_state(state, "I want a black shirt but no wool", 1)
         ranked = retriever.recommend(state, 4)
         self.assertNotEqual(ranked[0]["parent_asin"], "WOOL")
+
+    def test_retriever_matches_kicks_to_running_shoe(self) -> None:
+        retriever = ProductRetriever(self.catalog_path)
+        state = new_buyer_state("synonyms", {})
+        update_buyer_state(state, "I want lightweight kicks for jogging", 1)
+        ranked = retriever.recommend(state, 4)
+        self.assertEqual(ranked[0]["parent_asin"], "SHOE")
+
+    def test_retriever_matches_tee_to_tshirt(self) -> None:
+        retriever = ProductRetriever(self.catalog_path)
+        state = new_buyer_state("tee", {})
+        update_buyer_state(state, "I want a black cotton tee with a crew neck", 1)
+        ranked = retriever.recommend(state, 4)
+        self.assertEqual(ranked[0]["parent_asin"], "TARGET")
+
+    def test_duplicate_material_evidence_is_discounted(self) -> None:
+        retriever = ProductRetriever(self.catalog_path)
+        state = new_buyer_state("duplicates", {})
+        update_buyer_state(
+            state,
+            "I'm looking for shirts. A key requirement is: cotton.",
+            1,
+        )
+        update_buyer_state(state, "For that, what matters is: 100% cotton.", 2)
+        context = retriever._ranking_context(state)
+        material_weights = [
+            weight
+            for (attribute, _), weight in zip(context.records, context.evidence_weights)
+            if attribute == "material"
+        ]
+        self.assertEqual(material_weights[0], 1.0)
+        self.assertLess(material_weights[1], 1.0)
+
+    def test_named_color_is_weaker_than_an_unambiguous_product_color(self) -> None:
+        retriever = ProductRetriever(self.catalog_path)
+
+        def document(title: str) -> ProductDocument:
+            normalized = title.casefold()
+            return ProductDocument(
+                parent_asin=title,
+                title=normalized,
+                categories="t shirts",
+                features="",
+                details="",
+                store="example",
+                description="",
+                combined=normalized,
+                category_concept_mask=_concept_mask("t shirts"),
+                combined_concept_mask=_concept_mask(normalized),
+                explicit_color_mask=0,
+                title_colors=tuple(color for color in ("red", "black") if color in normalized),
+                price=None,
+                average_rating=0.0,
+                rating_number=0,
+            )
+
+        named = document("Red Hot Band T-Shirt Black")
+        unambiguous = document("Plain Red T-Shirt")
+        self.assertLess(
+            retriever._color_confidence(named, ["red"]),
+            retriever._color_confidence(unambiguous, ["red"]),
+        )
 
     def test_agent_returns_valid_contract_and_tracks_question(self) -> None:
         agent = Agent(self.catalog_path)

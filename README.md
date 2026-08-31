@@ -48,13 +48,21 @@ MTTC `9.81` on the released public set. See `docs/baseline_results.json`.
 
 ## Implemented Agent
 
-The current `starter/agent.py` connects two offline components:
+The current `starter/agent.py` connects four offline components:
 
 - `starter/tracker.py` maintains provenance-aware constraints, exclusions,
   boundary responses, question history, and targeted intent overrides.
-- `starter/retriever.py` uses SQLite FTS5 for multi-route candidate generation,
-  then reranks with cumulative constraint coverage, exclusions, price proximity,
-  profile tie-breakers, and catalog-valid fallbacks.
+- `starter/vocabulary.py` canonicalizes clothing vocabulary and expands safe
+  equivalents such as `kicks`/`running shoes`/`sneakers`, `tee`/`t-shirt`,
+  `hoodie`/`sweatshirt`, and `grey`/`gray`.
+- `starter/semantic.py` builds a deterministic local dense random-indexing
+  representation plus compact semantic postings. It requires no model download,
+  API key, or third-party package and is weighted primarily for Browsing recall.
+- `starter/retriever.py` combines expanded SQLite FTS5 routes with semantic
+  candidates, then reranks using field-specific, inverse-frequency-weighted
+  constraint coverage, duplicate-evidence discounts, confidence-aware colors,
+  rare title/brand matches, hybrid-category normalization, exclusions, price
+  proximity, and profile tie-breakers.
 
 The implementation uses only the Python standard library and requires no API
 key or network connection. Run all tests and the public evaluator with:
@@ -65,7 +73,8 @@ python3 -m evaluator.local_evaluator
 ```
 
 On the released 200-session set, the implemented agent scores Hit Rate@10
-`0.91`, MRR `0.616841`, MTTC `3.22`, and TechnicalScore `0.795652`. Public-set
+`0.935`, MRR `0.653841`, MTTC `2.97`, and TechnicalScore `0.824252`. It places
+108 of 200 targets at rank #1. Public-set
 metrics are development results and should not be interpreted as private-set
 performance.
 
